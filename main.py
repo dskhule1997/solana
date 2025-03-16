@@ -152,6 +152,7 @@ class TradingBot:
         self.telegram_bot.add_handler(CommandHandler("set_investment", self.set_investment))
         self.telegram_bot.add_handler(CommandHandler("set_take_profit", self.set_take_profit))
         self.telegram_bot.add_handler(CommandHandler("manage_wallets", self.manage_wallets))
+        self.telegram_bot.add_handler(CommandHandler("manage_wallets", self.manage_wallets_command))
         # Callback query handler
         self.telegram_bot.add_handler(CallbackQueryHandler(self.button_handler))
         
@@ -218,13 +219,13 @@ class TradingBot:
         if new_wallet:
             # Add name to wallet info
             new_wallet['name'] = f"Wallet {len(self.wallets['wallets']) + 1}"
-            
+                        
             # Add to wallets list
             self.wallets['wallets'].append(new_wallet)
-            
+                        
             # Set as active wallet
             self.wallets['active_wallet_index'] = len(self.wallets['wallets']) - 1
-            
+                        
             # Save wallets
             self._save_wallets()
             
@@ -274,7 +275,32 @@ class TradingBot:
             reply_markup=reply_markup,
             parse_mode='Markdown'
     )
+    
+    async def manage_wallets_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show wallet management options from command."""
+        keyboard = []
         
+        # Add button for each wallet
+        for i, wallet in enumerate(self.wallets['wallets']):
+            wallet_name = wallet.get('name', f"Wallet {i+1}")
+            active_marker = "✅ " if i == self.wallets['active_wallet_index'] else ""
+            keyboard.append([InlineKeyboardButton(
+                f"{active_marker}{wallet_name}", 
+                callback_data=f"select_wallet_{i}"
+            )])
+        
+        # Add button to create new wallet
+        keyboard.append([InlineKeyboardButton("➕ Create New Wallet", callback_data="create_wallet")])
+        keyboard.append([InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "🔑 *Wallet Management*\n\nSelect a wallet to use or create a new one:",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+    )
+      
     async def wallet_info_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Display wallet information."""
         if not self.wallet_info:
