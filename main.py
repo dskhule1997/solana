@@ -427,21 +427,48 @@ class TradingBot:
                 private_key = wallet_info['private_key']
                 safe_private_key = f"{private_key[:5]}...{private_key[-5:]}"
                 
+                # Simplified response without complex Markdown
                 response = (
                     "✅ New wallet created successfully!\n\n"
-                    f"🔑 Public Address: `{wallet_info['public_key']}`\n\n"
-                    f"🔐 Private Key: `{safe_private_key}`\n\n"
-                    "⚠️ *IMPORTANT:* Your full private key has been saved in the wallet_credentials.txt file. "
+                    f"🔑 Public Address: {wallet_info['public_key']}\n\n"
+                    f"🔐 Private Key: {safe_private_key}\n\n"
+                    "⚠️ IMPORTANT: Your full private key has been saved in the wallet_credentials.txt file. "
                     "Keep this file secure and do not share it with anyone!"
                 )
                 
-                await query.edit_message_text(response, parse_mode='Markdown')
+                # Remove parse_mode parameter
+                await query.edit_message_text(response)
             else:
                 await query.edit_message_text("❌ Failed to create a new wallet. Please try again later.")
                 
             
         elif callback_data == 'wallet_info':
-            await self.wallet_info_command(update, context)
+            # Direct handling in button_handler instead of calling wallet_info_command
+            if not self.wallet_info:
+                await query.edit_message_text(
+                    "❌ No wallet configured. Use /create_wallet to create a new one."
+                )
+                return
+            
+            # Get current balance
+            try:
+                balance = await self.solana_trader.get_balance()
+            except Exception as e:
+                logger.error(f"Error getting balance: {str(e)}")
+                balance = 0
+            
+            # Only show part of the private key for security
+            private_key = self.wallet_info['private_key']
+            safe_private_key = f"{private_key[:5]}...{private_key[-5:]}"
+            
+            response = (
+                "🔑 Wallet Information\n\n"
+                f"Public Address: {self.wallet_info['public_key']}\n\n"
+                f"Private Key: {safe_private_key}\n\n"
+                f"Balance: {balance} SOL"
+            )
+            
+            await query.edit_message_text(response)
         
         elif callback_data == 'manage_groups':
             keyboard = [
