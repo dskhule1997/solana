@@ -1,834 +1,858 @@
-import sys
-import pyperclip
-import ollama
-import keyboard
-import time
-import threading
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QTextEdit, QLineEdit, 
-                            QPushButton, QVBoxLayout, QHBoxLayout, QWidget, 
-                            QLabel, QFrame, QSplitter, QTabWidget, QComboBox,
-                            QAction, QMenu, QShortcut, QSystemTrayIcon, QToolButton)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QRect, QSize
-from PyQt5.QtGui import QFont, QIcon, QColor, QPalette, QKeySequence, QPixmap
-import pyautogui
-import pytesseract
-from PIL import Image, ImageGrab
+import logging
+import asyncio
+import json
+import os
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+from telethon import TelegramClient, events
+from telethon.tl.types import Channel
+import nest_asyncio
+nest_asyncio.apply()
 
-class OllamaThread(QThread):
-    response_ready = pyqtSignal(str)
-    
-    def __init__(self, prompt, code_context="", system_prompt=""):
-        super().__init__()
-        self.prompt = prompt
-        self.code_context = code_context
-        self.system_prompt = system_prompt
-        
-    def run(self):
-        try:
-            messages = []
-            
-            # Add system prompt if provided
-            if self.system_prompt:
-                messages.append({'role': 'system', 'content': self.system_prompt})
-            
-            # Prepare the user message with context
-            full_prompt = f"Code context:\n```python\n{self.code_context}\n```\n\nUser request: {self.prompt}"
-            messages.append({'role': 'user', 'content': full_prompt})
-            
-            # Call Ollama API
-            response = ollama.chat(
-                model='deepseek-coder-v2:latest',
-                messages=messages
-            )
-            
-            response_text = response['message']['content']
-            self.response_ready.emit(response_text)
-        except Exception as e:
-            self.response_ready.emit(f"Error: {str(e)}")
+# Local imports
+from telegram_listener import TelegramListener
+from solana_trader import SolanaTrader
 
-class CodeGenerationThread(QThread):
-    response_ready = pyqtSignal(str)
-    
-    def __init__(self, prompt, system_prompt=""):
-        super().__init__()
-        self.prompt = prompt
-        self.system_prompt = system_prompt
-        
-    def run(self):
-        try:
-            messages = []
-            
-            # Add system prompt if provided
-            if self.system_prompt:
-                messages.append({'role': 'system', 'content': self.system_prompt})
-            
-            # Add the user prompt for code generation
-            messages.append({'role': 'user', 'content': f"Generate code for: {self.prompt}"})
-            
-            # Call Ollama API
-            response = ollama.chat(
-                model='deepseek-coder-v2:latest',
-                messages=messages
-            )
-            
-            response_text = response['message']['content']
-            self.response_ready.emit(response_text)
-        except Exception as e:
-            self.response_ready.emit(f"Error: {str(e)}")
+# Set up logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-class ScreenMonitorThread(QThread):
-    code_detected = pyqtSignal(str)
-    
+# Conversation states
+SETUP, ADDING_GROUP, REMOVING_GROUP, SETTING_INVESTMENT, SETTING_TAKE_PROFIT = range(5)
+
+class TradingBot:
     def __init__(self):
-        super().__init__()
-        self.running = True
-        self.last_selection = ""
+        # Load credentials
+        self.credentials = self._load_credentials()
+        self.wallet_info = self._load_wallet_info()
+        self.monitored_groups = self._load_monitored_groups()
+        self.trading_settings = self._load_trading_settings()
+        
+        self.wallets = self._load_wallets()
+            # If we have a wallet_info but no wallets yet, migrate it
+        if self.wallet_info and not self.wallets['wallets']:
+            self.wallet_info['name'] = "Wallet 1"
+            self.wallets['wallets'].append(self.wallet_info)
+            self.wallets['active_wallet_index'] = 0
+            self._save_wallets()
+        # Initialize components
+        self.solana_trader = SolanaTrader(self.wallet_info, self.trading_settings)
+        
+        # Create the telegram listener
+        self.telegram_listener = TelegramListener(
+            api_id=self.credentials['api_id'],
+            api_hash=self.credentials['api_hash'],
+            bot_token=self.credentials['bot_token'],
+            callback=self.process_new_ca
+        )
+        
+        # Initialize the telegram bot
+        self.telegram_bot = Application.builder().token(self.credentials['bot_token']).build()
+        self._setup_handlers()
+
+    def _load_credentials(self):
+        try:
+            with open('credentials.txt', 'r') as f:
+                creds = {}
+                for line in f:
+                    if '=' in line:
+                        key, value = line.strip().split('=', 1)
+                        creds[key.strip()] = value.strip().strip("'").strip('"')
+                return creds
+        except FileNotFoundError:
+            logger.error("Credentials file not found. Please create a credentials.txt file.")
+            return {
+                'api_id': '',
+                'api_hash': '',
+                'bot_token': ''
+            }
+
+    def _load_wallet_info(self):
+        try:
+            with open('wallet_credentials.txt', 'r') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+
+    def _save_wallet_info(self, wallet_info):
+        with open('wallet_credentials.txt', 'w') as f:
+            json.dump(wallet_info, f)
+        self.wallet_info = wallet_info
+
+    def _load_monitored_groups(self):
+        try:
+            with open('monitored_groups.txt', 'r') as f:
+                return [line.strip() for line in f if line.strip()]
+        except FileNotFoundError:
+            return []
+
+    def _save_monitored_groups(self):
+        with open('monitored_groups.txt', 'w') as f:
+            for group in self.monitored_groups:
+                f.write(f"{group}\n")
+
+    def _load_trading_settings(self):
+        try:
+            with open('trading_settings.json', 'r') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            # Default settings
+            default_settings = {
+                'initial_investment': 0.1,  # SOL
+                'take_profit_percentage': 30,  # %
+                'sell_percentage': 50,  # %
+                'max_slippage': 1,  # %
+                'traded_tokens': []  # List of already traded token addresses
+            }
+            with open('trading_settings.json', 'w') as f:
+                json.dump(default_settings, f)
+            return default_settings
+
+    def _load_wallets(self):
+        """Load all saved wallets."""
+        try:
+            with open('wallets.json', 'r') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            # Initialize with empty list
+            wallets = {'wallets': [], 'active_wallet_index': -1}
+            with open('wallets.json', 'w') as f:
+                json.dump(wallets, f)
+            return wallets
+
+    def _save_wallets(self):
+        """Save all wallets to file."""
+        with open('wallets.json', 'w') as f:
+            json.dump(self.wallets, f)
+
+    def _get_active_wallet(self):
+        """Get the currently active wallet."""
+        if self.wallets['active_wallet_index'] >= 0 and len(self.wallets['wallets']) > self.wallets['active_wallet_index']:
+            return self.wallets['wallets'][self.wallets['active_wallet_index']]
+        return None
+
+    def _save_trading_settings(self):
+        with open('trading_settings.json', 'w') as f:
+            json.dump(self.trading_settings, f)
+
+    def _setup_handlers(self):
+        # Command handlers
+        self.telegram_bot.add_handler(CommandHandler("start", self.start))
+        self.telegram_bot.add_handler(CommandHandler("help", self.help_command))
+        self.telegram_bot.add_handler(CommandHandler("create_wallet", self.create_wallet))
+        self.telegram_bot.add_handler(CommandHandler("wallet_info", self.wallet_info_command))
+        self.telegram_bot.add_handler(CommandHandler("withdraw", self.withdraw))
+        self.telegram_bot.add_handler(CommandHandler("add_group", self.add_group))
+        self.telegram_bot.add_handler(CommandHandler("remove_group", self.remove_group))
+        self.telegram_bot.add_handler(CommandHandler("list_groups", self.list_groups))
+        self.telegram_bot.add_handler(CommandHandler("settings", self.show_settings))
+        self.telegram_bot.add_handler(CommandHandler("set_investment", self.set_investment))
+        self.telegram_bot.add_handler(CommandHandler("set_take_profit", self.set_take_profit))
+        self.telegram_bot.add_handler(CommandHandler("manage_wallets", self.manage_wallets))
+        # Callback query handler
+        self.telegram_bot.add_handler(CallbackQueryHandler(self.button_handler))
+        
+        # Conversation handlers for more complex flows
+        self.telegram_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.text_handler))
+        
+        # Error handler
+        self.telegram_bot.add_error_handler(self.error_handler)
+
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Send a message when the command /start is issued."""
+        user = update.effective_user
+        
+        welcome_text = (
+            f"Hi {user.first_name}! I'm your Solana Trading Bot.\n\n"
+            "I can monitor Telegram groups for new Solana tokens and trade them automatically."
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton("Manage Wallets", callback_data='manage_wallets')],
+            [InlineKeyboardButton("Create Wallet", callback_data='create_wallet')],
+            [InlineKeyboardButton("Wallet Info", callback_data='wallet_info')],
+            [InlineKeyboardButton("Manage Groups", callback_data='manage_groups')],
+            [InlineKeyboardButton("Trading Settings", callback_data='trading_settings')],
+            [InlineKeyboardButton("Help", callback_data='help')]
+        ]
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(welcome_text, reply_markup=reply_markup)
+
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Send a message when the command /help is issued."""
+        help_text = (
+            "🤖 *Solana Trading Bot Commands* 🤖\n\n"
+            "*Wallet Commands:*\n"
+            "/create_wallet - Generate a new Solana wallet\n"
+            "/wallet_info - Display your current wallet info\n"
+            "/withdraw <amount> <address> - Withdraw funds to another wallet\n\n"
+            
+            "*Group Management:*\n"
+            "/add_group <group_link> - Add a Telegram group to monitor\n"
+            "/remove_group - Shows a list of groups to remove\n"
+            "/list_groups - List all monitored groups\n\n"
+            
+            "*Trading Settings:*\n"
+            "/settings - View current trading settings\n"
+            "/set_investment <amount> - Set initial investment amount in SOL\n"
+            "/set_take_profit <profit_percentage> <sell_percentage> - Set take profit conditions\n"
+            "Example: /set_take_profit 30 50 - Sell 50% when profit reaches 30%\n\n"
+            
+            "*Other Commands:*\n"
+            "/start - Show the main menu\n"
+            "/help - Display this help message"
+        )
+        
+        await update.message.reply_text(help_text, parse_mode='Markdown')
+
+    async def create_wallet(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Create a new Solana wallet."""
+        # Generate a new wallet using the SolanaTrader
+        new_wallet = self.solana_trader.create_new_wallet()
+        
+        if new_wallet:
+            # Add name to wallet info
+            new_wallet['name'] = f"Wallet {len(self.wallets['wallets']) + 1}"
+            
+            # Add to wallets list
+            self.wallets['wallets'].append(new_wallet)
+            
+            # Set as active wallet
+            self.wallets['active_wallet_index'] = len(self.wallets['wallets']) - 1
+            
+            # Save wallets
+            self._save_wallets()
+            
+            # Update trader's wallet info
+            self.solana_trader.wallet_info = new_wallet
+            self.wallet_info = new_wallet  # For backward compatibility
+            
+            # Only show part of the private key for security
+            private_key = new_wallet['private_key']
+            safe_private_key = f"{private_key[:5]}...{private_key[-5:]}"
+            
+            response = (
+                "✅ New wallet created successfully!\n\n"
+                f"🔑 Public Address: `{new_wallet['public_key']}`\n\n"
+                f"🔐 Private Key: `{safe_private_key}`\n\n"
+                "⚠️ *IMPORTANT:* Your wallet has been saved and set as active."
+            )
+        else:
+            response = "❌ Failed to create a new wallet. Please try again later."
+        
+        await update.message.reply_text(response, parse_mode='Markdown')
+
+    async def manage_wallets(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show wallet management options."""
+        query = update.callback_query  # Get the callback query
+        await query.answer()  # Acknowledge the callback query
+
+        keyboard = []
+        
+        # Add button for each wallet
+        for i, wallet in enumerate(self.wallets['wallets']):
+            wallet_name = wallet.get('name', f"Wallet {i+1}")
+            active_marker = "✅ " if i == self.wallets['active_wallet_index'] else ""
+            keyboard.append([InlineKeyboardButton(
+                f"{active_marker}{wallet_name}", 
+                callback_data=f"select_wallet_{i}"
+            )])
+        
+        # Add button to create new wallet
+        keyboard.append([InlineKeyboardButton("➕ Create New Wallet", callback_data="create_wallet")])
+        keyboard.append([InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            "🔑 *Wallet Management*\n\nSelect a wallet to use or create a new one:",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+    )
+        
+    async def wallet_info_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Display wallet information."""
+        if not self.wallet_info:
+            await update.message.reply_text(
+                "❌ No wallet configured. Use /create_wallet to create a new one."
+            )
+            return
+        
+        # Get current balance
+        balance = await self.solana_trader.get_balance()
+        
+        # Only show part of the private key for security
+        private_key = self.wallet_info['private_key']
+        safe_private_key = f"{private_key[:5]}...{private_key[-5:]}"
+        
+        response = (
+            "🔑 *Wallet Information*\n\n"
+            f"Public Address: `{self.wallet_info['public_key']}`\n\n"
+            f"Private Key: `{safe_private_key}`\n\n"
+            f"Balance: {balance} SOL"
+        )
+        
+        await update.message.reply_text(response, parse_mode='Markdown')
+
+    async def withdraw(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Withdraw funds to another wallet."""
+        if not self.wallet_info:
+            await update.message.reply_text(
+                "❌ No wallet configured. Use /create_wallet to create a new one."
+            )
+            return
+        
+        if len(context.args) != 2:
+            await update.message.reply_text(
+                "❌ Please use the format: /withdraw <amount> <destination_address>"
+            )
+            return
+        
+        try:
+            amount = float(context.args[0])
+            destination = context.args[1]
+            
+            # Validate the amount and destination
+            if amount <= 0:
+                await update.message.reply_text("❌ Amount must be greater than 0.")
+                return
+            
+            # Send the transaction
+            result = await self.solana_trader.withdraw(amount, destination)
+            
+            if result['success']:
+                response = (
+                    "✅ Withdrawal successful!\n\n"
+                    f"Amount: {amount} SOL\n"
+                    f"Destination: {destination}\n"
+                    f"Transaction signature: {result['signature']}"
+                )
+            else:
+                response = f"❌ Withdrawal failed: {result['error']}"
+                
+            await update.message.reply_text(response)
+            
+        except ValueError:
+            await update.message.reply_text("❌ Invalid amount. Please provide a valid number.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {str(e)}")
+
+    async def add_group(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Add a Telegram group to monitor."""
+        if len(context.args) != 1:
+            await update.message.reply_text(
+                "❌ Please provide the group link.\n"
+                "Example: /add_group https://t.me/groupname"
+            )
+            return
+        
+        group_link = context.args[0]
+        
+        # Validate the group link
+        if not group_link.startswith("https://t.me/"):
+            await update.message.reply_text(
+                "❌ Invalid group link. It should start with https://t.me/"
+            )
+            return
+        
+        # Add to the list if not already there
+        if group_link not in self.monitored_groups:
+            self.monitored_groups.append(group_link)
+            self._save_monitored_groups()
+            
+            # Add the listener for this group
+            await self.telegram_listener.add_group(group_link)
+            
+            response = f"✅ Successfully added {group_link} to monitored groups."
+        else:
+            response = f"⚠️ {group_link} is already being monitored."
+        
+        await update.message.reply_text(response)
+
+    async def remove_group(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show groups to remove with inline buttons."""
+        if not self.monitored_groups:
+            await update.message.reply_text("❌ No groups are currently being monitored.")
+            return
+        
+        keyboard = []
+        for group in self.monitored_groups:
+            keyboard.append([InlineKeyboardButton(group, callback_data=f"remove_{group}")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "Select a group to remove:",
+            reply_markup=reply_markup
+        )
+
+    async def list_groups(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """List all monitored groups."""
+        if not self.monitored_groups:
+            await update.message.reply_text("⚠️ No groups are currently being monitored.")
+            return
+        
+        response = "📋 *Monitored Groups:*\n\n"
+        for i, group in enumerate(self.monitored_groups, 1):
+            response += f"{i}. {group}\n"
+        
+        await update.message.reply_text(response, parse_mode='Markdown')
+
+    async def show_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show current trading settings."""
+        settings = self.trading_settings
+        
+        response = (
+            "⚙️ *Trading Settings*\n\n"
+            f"Initial Investment: {settings['initial_investment']} SOL\n"
+            f"Take Profit: {settings['take_profit_percentage']}%\n"
+            f"Sell Percentage: {settings['sell_percentage']}%\n"
+            f"Max Slippage: {settings['max_slippage']}%\n\n"
+            f"Tokens Traded: {len(settings['traded_tokens'])}"
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton("Set Investment", callback_data='set_investment')],
+            [InlineKeyboardButton("Set Take Profit", callback_data='set_take_profit')],
+            [InlineKeyboardButton("Main Menu", callback_data='main_menu')]
+        ]
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(response, reply_markup=reply_markup, parse_mode='Markdown')
+
+    async def set_investment(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Set the initial investment amount."""
+        if len(context.args) != 1:
+            await update.message.reply_text(
+                "❌ Please provide the investment amount in SOL.\n"
+                "Example: /set_investment 0.5"
+            )
+            return
+        
+        try:
+            amount = float(context.args[0])
+            
+            if amount <= 0:
+                await update.message.reply_text("❌ Amount must be greater than 0.")
+                return
+            
+            self.trading_settings['initial_investment'] = amount
+            self._save_trading_settings()
+            
+            await update.message.reply_text(f"✅ Initial investment amount set to {amount} SOL.")
+            
+        except ValueError:
+            await update.message.reply_text("❌ Invalid amount. Please provide a valid number.")
+
+    async def set_take_profit(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Set the take profit conditions."""
+        if len(context.args) != 2:
+            await update.message.reply_text(
+                "❌ Please provide both profit percentage and sell percentage.\n"
+                "Example: /set_take_profit 30 50"
+            )
+            return
+        
+        try:
+            profit_percentage = float(context.args[0])
+            sell_percentage = float(context.args[1])
+            
+            if profit_percentage <= 0 or sell_percentage <= 0 or sell_percentage > 100:
+                await update.message.reply_text(
+                    "❌ Invalid values. Profit percentage must be greater than 0, "
+                    "and sell percentage must be between 0 and 100."
+                )
+                return
+            
+            self.trading_settings['take_profit_percentage'] = profit_percentage
+            self.trading_settings['sell_percentage'] = sell_percentage
+            self._save_trading_settings()
+            
+            await update.message.reply_text(
+                f"✅ Take profit settings updated:\n"
+                f"- Sell {sell_percentage}% of tokens when profit reaches {profit_percentage}%"
+            )
+            
+        except ValueError:
+            await update.message.reply_text("❌ Invalid values. Please provide valid numbers.")
+
+    async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        await query.answer()
     
-    def run(self):
-        while self.running:
+        callback_data = query.data
+    
+                # In button_handler method
+            # In button_handler method
+        if callback_data == 'create_wallet':
+            # Create new wallet
+            wallet_info = self.solana_trader.create_new_wallet()
+            
+            if wallet_info:
+                # Only show part of the private key for security
+                private_key = wallet_info['private_key']
+                safe_private_key = f"{private_key[:5]}...{private_key[-5:]}"
+                
+                # Simplified response without complex Markdown
+                response = (
+                    "✅ New wallet created successfully!\n\n"
+                    f"🔑 Public Address: {wallet_info['public_key']}\n\n"
+                    f"🔐 Private Key: {safe_private_key}\n\n"
+                    "⚠️ IMPORTANT: Your full private key has been saved in the wallet_credentials.txt file. "
+                    "Keep this file secure and do not share it with anyone!"
+                )
+                
+                # Remove parse_mode parameter
+                await query.edit_message_text(response)
+            else:
+                await query.edit_message_text("❌ Failed to create a new wallet. Please try again later.")
+                
+            
+        elif callback_data == 'wallet_info':
+            # Direct handling in button_handler instead of calling wallet_info_command
+            if not self.wallet_info:
+                await query.edit_message_text(
+                    "❌ No wallet configured. Use /create_wallet to create a new one."
+                )
+                return
+            
+            # Get current balance
             try:
-                # Check for selection
-                selected_text = self.get_selected_text()
-                if selected_text and selected_text != self.last_selection and self.is_code(selected_text):
-                    self.last_selection = selected_text
-                    self.code_detected.emit(selected_text)
-                    time.sleep(1)  # Avoid rapid-fire detections
-                else:
-                    time.sleep(0.5)
+                balance = await self.solana_trader.get_balance()
             except Exception as e:
-                print(f"Screen monitoring error: {str(e)}")
-                time.sleep(1)
-    
-    def get_selected_text(self):
-        # First try to get from clipboard (most reliable)
-        try:
-            # Simulate Ctrl+C to copy selected text
-            keyboard.send('ctrl+c')
-            time.sleep(0.1)  # Give system time to process
-            return pyperclip.paste()
-        except:
-            pass
+                logger.error(f"Error getting balance: {str(e)}")
+                balance = 0
             
-        # Fallback to OCR for selected regions
-        try:
-            # If there's a visible selection, attempt to capture it via screenshot + OCR
-            selection = self.capture_selection()
-            if selection:
-                return selection
-        except:
-            pass
+            # Only show part of the private key for security
+            private_key = self.wallet_info['private_key']
+            safe_private_key = f"{private_key[:5]}...{private_key[-5:]}"
             
-        return ""
-    
-    def is_code(self, text):
-        # Simple heuristic to detect if text might be code
-        code_indicators = ['def ', 'class ', 'import ', 'from ', '    ', '\t', ';', '==', '+=', '-=', '>=', '<=']
-        return any(indicator in text for indicator in code_indicators)
-    
-    def capture_selection(self):
-        # This is a simplified version - would need OS-specific enhancements
-        try:
-            # Try to find a selection (highlighted text)
-            # This is a placeholder - actual implementation would be more complex
-            screenshot = ImageGrab.grab()
-            # Would need image processing to detect highlighted areas
-            # For now, this is a simplified placeholder
-            return ""
-        except:
-            return ""
-    
-    def stop(self):
-        self.running = False
+            response = (
+                "🔑 Wallet Information\n\n"
+                f"Public Address: {self.wallet_info['public_key']}\n\n"
+                f"Private Key: {safe_private_key}\n\n"
+                f"Balance: {balance} SOL"
+            )
+            
+            await query.edit_message_text(response)
+        elif callback_data == 'manage_wallets':
+            await self.manage_wallets(update, context)
 
-class VivirAICoder(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("VivirAI Coder")
-        self.setGeometry(100, 100, 800, 700)
-        
-        # Make window resizable but stay on top
-        self.setWindowFlag(Qt.WindowStaysOnTopHint)
-        
-        # Set modern dark theme inspired by Cursor
-        self.apply_cursor_theme()
-        
-        # Initialize system tray
-        self.setup_system_tray()
-        
-        # Initialize screen monitoring
-        self.start_screen_monitoring()
-        
-        # Initialize UI
-        self.init_ui()
-        
-        # Setup global shortcuts
-        self.setup_global_shortcuts()
-        
-        # System prompt for consistent responses
-        self.system_prompt = """You are a coding assistant. 
-        Your primary role is to help with code improvements, bug fixes, and writing new code.
-        Always provide well-documented, efficient code. 
-        For code improvements, clearly explain what you changed and why.
-        For bug fixes, explain the issue and your solution. 
-        For new code, provide complete implementations with comments."""
-    
-    def apply_cursor_theme(self):
-        self.setStyleSheet("""
-            QMainWindow, QWidget {
-                background-color: #1e1e1e;
-                color: #d4d4d4;
-                font-family: 'Segoe UI', 'SF Pro Text', sans-serif;
-            }
-            QTextEdit, QLineEdit {
-                background-color: #252526;
-                color: #d4d4d4;
-                border: 1px solid #3E3E42;
-                border-radius: 4px;
-                padding: 8px;
-                font-family: 'Consolas', 'SF Mono', monospace;
-                font-size: 14px;
-                selection-background-color: #264f78;
-            }
-            QTabWidget::pane {
-                border: 1px solid #3E3E42;
-                background-color: #252526;
-            }
-            QTabBar::tab {
-                background-color: #2d2d2d;
-                color: #d4d4d4;
-                padding: 8px 16px;
-                margin-right: 2px;
-                border-top-left-radius: 4px;
-                border-top-right-radius: 4px;
-            }
-            QTabBar::tab:selected {
-                background-color: #252526;
-                border-bottom: 2px solid #007acc;
-            }
-            QPushButton {
-                background-color: #0e639c;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 8px 16px;
-                font-weight: bold;
-                min-height: 30px;
-            }
-            QPushButton:hover {
-                background-color: #1177bb;
-            }
-            QPushButton:pressed {
-                background-color: #00559B;
-            }
-            QPushButton:disabled {
-                background-color: #3a3d41;
-                color: #848484;
-            }
-            QLabel {
-                color: #d4d4d4;
-                font-weight: bold;
-            }
-            QComboBox {
-                background-color: #3c3c3c;
-                color: #d4d4d4;
-                border: 1px solid #3E3E42;
-                border-radius: 4px;
-                padding: 5px;
-                min-height: 30px;
-            }
-            QComboBox::drop-down {
-                subcontrol-origin: padding;
-                subcontrol-position: top right;
-                width: 15px;
-                border-left-width: 1px;
-                border-left-color: #3E3E42;
-                border-left-style: solid;
-            }
-            QScrollBar:vertical {
-                border: none;
-                background: #2b2b2b;
-                width: 12px;
-                margin: 0px;
-            }
-            QScrollBar::handle:vertical {
-                background: #5a5a5a;
-                min-height: 20px;
-                border-radius: 6px;
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                height: 0px;
-            }
-            QToolButton {
-                background-color: transparent;
-                border: none;
-                padding: 5px;
-            }
-            QToolButton:hover {
-                background-color: #3e3e42;
-                border-radius: 4px;
-            }
-        """)
-    
-    def init_ui(self):
-        # Main layout with tabs
-        self.tab_widget = QTabWidget()
-        
-        # Create tabs
-        self.assistant_tab = QWidget()
-        self.code_gen_tab = QWidget()
-        
-        self.setup_assistant_tab()
-        self.setup_code_gen_tab()
-        
-        self.tab_widget.addTab(self.assistant_tab, "Code Assistant")
-        self.tab_widget.addTab(self.code_gen_tab, "Code Generator")
-        
-        self.setCentralWidget(self.tab_widget)
-        
-        # Create menu bar
-        self.setup_menu_bar()
-        
-        # Status bar
-        self.statusBar().showMessage("Ready")
-    
-    def setup_assistant_tab(self):
-        # Main layout
-        layout = QVBoxLayout()
-        
-        # Header with logo
-        header = QHBoxLayout()
-        logo_label = QLabel("✨ VivirAI Coder")
-        logo_label.setFont(QFont("Segoe UI", 16, QFont.Bold))
-        header.addWidget(logo_label)
-        
-        # Add model selector
-        model_label = QLabel("Model:")
-        self.model_selector = QComboBox()
-        self.model_selector.addItems(["deepseek-coder-v2", "codellama", "mistral"])
-        header.addWidget(model_label)
-        header.addWidget(self.model_selector)
-        
-        header.addStretch()
-        layout.addLayout(header)
-        
-        # Splitter for code and output
-        splitter = QSplitter(Qt.Vertical)
-        
-        # Input area (top)
-        input_widget = QWidget()
-        input_layout = QVBoxLayout(input_widget)
-        
-        # Code context
-        input_frame = QFrame()
-        input_frame.setFrameShape(QFrame.StyledPanel)
-        input_layout_inner = QVBoxLayout(input_frame)
-        
-        input_header = QHBoxLayout()
-        input_label = QLabel("Code Context")
-        input_header.addWidget(input_label)
-        
-        refresh_button = QPushButton("Refresh")
-        refresh_button.setMaximumWidth(100)
-        refresh_button.clicked.connect(self.refresh_from_clipboard)
-        input_header.addWidget(refresh_button)
-        input_layout_inner.addLayout(input_header)
-        
-        self.code_context = QTextEdit()
-        self.code_context.setMinimumHeight(200)
-        self.code_context.setPlaceholderText("Code will appear here when you select text in your editor...")
-        input_layout_inner.addWidget(self.code_context)
-        
-        # Prompt input
-        prompt_label = QLabel("What would you like to do with this code?")
-        self.prompt_input = QLineEdit()
-        self.prompt_input.setPlaceholderText("E.g., 'Optimize this function' or 'Fix the bugs'...")
-        self.prompt_input.returnPressed.connect(self.get_assistance)
-        
-        input_layout_inner.addWidget(prompt_label)
-        input_layout_inner.addWidget(self.prompt_input)
-        
-        # Buttons
-        button_layout = QHBoxLayout()
-        self.get_help_button = QPushButton("Get Assistance")
-        self.get_help_button.clicked.connect(self.get_assistance)
-        self.clear_button = QPushButton("Clear")
-        self.clear_button.clicked.connect(self.clear_fields)
-        
-        button_layout.addWidget(self.get_help_button)
-        button_layout.addWidget(self.clear_button)
-        input_layout_inner.addLayout(button_layout)
-        
-        input_layout.addWidget(input_frame)
-        
-        # Output area (bottom)
-        output_widget = QWidget()
-        output_layout = QVBoxLayout(output_widget)
-        
-        output_frame = QFrame()
-        output_frame.setFrameShape(QFrame.StyledPanel)
-        output_layout_inner = QVBoxLayout(output_frame)
-        
-        output_header = QHBoxLayout()
-        output_label = QLabel("AI Suggestions")
-        output_header.addWidget(output_label)
-        output_layout_inner.addLayout(output_header)
-        
-        self.output_text = QTextEdit()
-        self.output_text.setReadOnly(True)
-        self.output_text.setMinimumHeight(200)
-        self.output_text.setPlaceholderText("AI suggestions will appear here...")
-        output_layout_inner.addWidget(self.output_text)
-        
-        # Action buttons
-        action_layout = QHBoxLayout()
-        self.copy_button = QPushButton("Copy Code")
-        self.copy_button.clicked.connect(self.copy_code)
-        self.copy_all_button = QPushButton("Copy All")
-        self.copy_all_button.clicked.connect(self.copy_all)
-        self.apply_button = QPushButton("Apply to Editor")
-        self.apply_button.clicked.connect(self.apply_to_editor)
-        
-        action_layout.addWidget(self.copy_button)
-        action_layout.addWidget(self.copy_all_button)
-        action_layout.addWidget(self.apply_button)
-        output_layout_inner.addLayout(action_layout)
-        
-        output_layout.addWidget(output_frame)
-        
-        # Add both to splitter
-        splitter.addWidget(input_widget)
-        splitter.addWidget(output_widget)
-        
-        # Set initial sizes
-        splitter.setSizes([300, 400])
-        
-        layout.addWidget(splitter)
-        
-        # Set the layout
-        self.assistant_tab.setLayout(layout)
-    
-    def setup_code_gen_tab(self):
-        # Main layout for code generation tab
-        layout = QVBoxLayout()
-        
-        # Header
-        header = QHBoxLayout()
-        gen_label = QLabel("🚀 Code Generator")
-        gen_label.setFont(QFont("Segoe UI", 16, QFont.Bold))
-        header.addWidget(gen_label)
-        header.addStretch()
-        layout.addLayout(header)
-        
-        # Splitter for input and output
-        splitter = QSplitter(Qt.Vertical)
-        
-        # Input area (top)
-        input_widget = QWidget()
-        input_layout = QVBoxLayout(input_widget)
-        
-        input_frame = QFrame()
-        input_frame.setFrameShape(QFrame.StyledPanel)
-        input_layout_inner = QVBoxLayout(input_frame)
-        
-        prompt_label = QLabel("What code would you like me to generate?")
-        self.gen_prompt = QTextEdit()
-        self.gen_prompt.setMinimumHeight(100)
-        self.gen_prompt.setPlaceholderText("Describe the code you need in detail. For example: 'Create a function that sorts a list of dictionaries by a specific key' or 'Write a class for managing a simple inventory system'...")
-        
-        input_layout_inner.addWidget(prompt_label)
-        input_layout_inner.addWidget(self.gen_prompt)
-        
-        # Options
-        options_layout = QHBoxLayout()
-        
-        language_label = QLabel("Language:")
-        self.language_selector = QComboBox()
-        self.language_selector.addItems(["Python", "JavaScript", "TypeScript", "Java", "C++", "C#", "Go", "Rust", "PHP", "Ruby"])
-        self.language_selector.setCurrentText("Python")
-        
-        options_layout.addWidget(language_label)
-        options_layout.addWidget(self.language_selector)
-        options_layout.addStretch()
-        
-        input_layout_inner.addLayout(options_layout)
-        
-        # Generate button
-        self.generate_button = QPushButton("Generate Code")
-        self.generate_button.clicked.connect(self.generate_code)
-        input_layout_inner.addWidget(self.generate_button)
-        
-        input_layout.addWidget(input_frame)
-        
-        # Output area (bottom)
-        output_widget = QWidget()
-        output_layout = QVBoxLayout(output_widget)
-        
-        output_frame = QFrame()
-        output_frame.setFrameShape(QFrame.StyledPanel)
-        output_layout_inner = QVBoxLayout(output_frame)
-        
-        output_label = QLabel("Generated Code")
-        self.gen_output = QTextEdit()
-        self.gen_output.setReadOnly(True)
-        self.gen_output.setMinimumHeight(200)
-        self.gen_output.setPlaceholderText("Generated code will appear here...")
-        
-        output_layout_inner.addWidget(output_label)
-        output_layout_inner.addWidget(self.gen_output)
-        
-        # Action buttons
-        action_layout = QHBoxLayout()
-        self.gen_copy_button = QPushButton("Copy Code")
-        self.gen_copy_button.clicked.connect(self.copy_generated_code)
-        self.gen_insert_button = QPushButton("Insert at Cursor")
-        self.gen_insert_button.clicked.connect(self.insert_at_cursor)
-        
-        action_layout.addWidget(self.gen_copy_button)
-        action_layout.addWidget(self.gen_insert_button)
-        output_layout_inner.addLayout(action_layout)
-        
-        output_layout.addWidget(output_frame)
-        
-        # Add both to splitter
-        splitter.addWidget(input_widget)
-        splitter.addWidget(output_widget)
-        
-        # Set initial sizes
-        splitter.setSizes([300, 400])
-        
-        layout.addWidget(splitter)
-        
-        # Set the layout
-        self.code_gen_tab.setLayout(layout)
-    
-    def setup_menu_bar(self):
-        menubar = self.menuBar()
-        
-        # File menu
-        file_menu = menubar.addMenu('File')
-        
-        new_action = QAction('New Session', self)
-        new_action.setShortcut('Ctrl+N')
-        new_action.triggered.connect(self.clear_fields)
-        file_menu.addAction(new_action)
-        
-        exit_action = QAction('Exit', self)
-        exit_action.setShortcut('Ctrl+Q')
-        exit_action.triggered.connect(self.close_application)
-        file_menu.addAction(exit_action)
-        
-        # Edit menu
-        edit_menu = menubar.addMenu('Edit')
-        
-        copy_action = QAction('Copy', self)
-        copy_action.setShortcut('Ctrl+C')
-        copy_action.triggered.connect(self.copy_selection)
-        edit_menu.addAction(copy_action)
-        
-        paste_action = QAction('Paste', self)
-        paste_action.setShortcut('Ctrl+V')
-        paste_action.triggered.connect(self.paste_clipboard)
-        edit_menu.addAction(paste_action)
-        
-        # Settings menu
-        settings_menu = menubar.addMenu('Settings')
-        
-        always_on_top = QAction('Always on Top', self)
-        always_on_top.setCheckable(True)
-        always_on_top.setChecked(True)
-        always_on_top.triggered.connect(self.toggle_always_on_top)
-        settings_menu.addAction(always_on_top)
-        
-        # Help menu
-        help_menu = menubar.addMenu('Help')
-        
-        about_action = QAction('About', self)
-        about_action.triggered.connect(self.show_about)
-        help_menu.addAction(about_action)
-    
-    def setup_system_tray(self):
-        # Create system tray icon
-        self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setIcon(QIcon("icon.png"))  # Replace with your icon
-        
-        # Create tray menu
-        tray_menu = QMenu()
-        
-        show_action = QAction("Show", self)
-        show_action.triggered.connect(self.show)
-        tray_menu.addAction(show_action)
-        
-        hide_action = QAction("Hide", self)
-        hide_action.triggered.connect(self.hide)
-        tray_menu.addAction(hide_action)
-        
-        tray_menu.addSeparator()
-        
-        exit_action = QAction("Exit", self)
-        exit_action.triggered.connect(self.close_application)
-        tray_menu.addAction(exit_action)
-        
-        self.tray_icon.setContextMenu(tray_menu)
-        self.tray_icon.show()
-    
-    def setup_global_shortcuts(self):
-        # Set up global shortcut for quick access
-        self.shortcut_get_selected = QShortcut(QKeySequence("Ctrl+Shift+A"), self)
-        self.shortcut_get_selected.activated.connect(self.get_selected_code)
-        
-        self.shortcut_toggle_visibility = QShortcut(QKeySequence("Ctrl+Shift+V"), self)
-        self.shortcut_toggle_visibility.activated.connect(self.toggle_visibility)
-    
-    def start_screen_monitoring(self):
-        self.screen_monitor = ScreenMonitorThread()
-        self.screen_monitor.code_detected.connect(self.update_code_context)
-        self.screen_monitor.start()
-    
-    def update_code_context(self, code):
-        if code:
-            self.code_context.setText(code)
-            self.statusBar().showMessage("Code detected!", 3000)
-    
-    def get_selected_code(self):
-        # Force a check for selected code
-        keyboard.send('ctrl+c')
-        time.sleep(0.1)
-        selected_text = pyperclip.paste()
-        
-        if selected_text:
-            self.code_context.setText(selected_text)
-            self.show()
-            self.raise_()
-            self.activateWindow()
-    
-    def toggle_visibility(self):
-        if self.isVisible():
-            self.hide()
-        else:
-            self.show()
-            self.raise_()
-            self.activateWindow()
-    
-    def get_assistance(self):
-        prompt = self.prompt_input.text()
-        code = self.code_context.toPlainText()
-        
-        if not prompt:
-            self.statusBar().showMessage("Please enter a prompt")
-            return
+        elif callback_data.startswith('select_wallet_'):
+            # Extract wallet index from callback data
+            wallet_index = int(callback_data[14:])
             
-        self.statusBar().showMessage("Thinking...")
-        self.get_help_button.setEnabled(False)
+            if wallet_index >= 0 and wallet_index < len(self.wallets['wallets']):
+                # Set as active wallet
+                self.wallets['active_wallet_index'] = wallet_index
+                selected_wallet = self.wallets['wallets'][wallet_index]
+                
+                # Update trader's wallet info
+                self.solana_trader.wallet_info = selected_wallet
+                self.wallet_info = selected_wallet  # For backward compatibility
+                
+                # Save wallets
+                self._save_wallets()
+                
+                wallet_name = selected_wallet.get('name', f"Wallet {wallet_index+1}")
+                await query.edit_message_text(f"✅ Wallet '{wallet_name}' is now active.")
+            else:
+                await query.edit_message_text("❌ Invalid wallet selection.")
+
+        elif callback_data == 'manage_groups':
+            keyboard = [
+                [InlineKeyboardButton("Add Group", callback_data='add_group')],
+                [InlineKeyboardButton("Remove Group", callback_data='remove_group')],
+                [InlineKeyboardButton("List Groups", callback_data='list_groups')],
+                [InlineKeyboardButton("Back to Main Menu", callback_data='main_menu')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("📋 Group Management", reply_markup=reply_markup)
         
-        # Start thread to call Ollama
-        self.ollama_thread = OllamaThread(prompt, code, self.system_prompt)
-        self.ollama_thread.response_ready.connect(self.update_response)
-        self.ollama_thread.start()
-    
-    def update_response(self, response):
-        self.output_text.setText(response)
-        self.statusBar().showMessage("Ready")
-        self.get_help_button.setEnabled(True)
-    
-    def generate_code(self):
-        prompt = self.gen_prompt.toPlainText()
-        language = self.language_selector.currentText()
+        elif callback_data == 'trading_settings':
+            settings = self.trading_settings
+            text = (
+                "⚙️ *Trading Settings*\n\n"
+                f"Initial Investment: {settings['initial_investment']} SOL\n"
+                f"Take Profit: {settings['take_profit_percentage']}%\n"
+                f"Sell Percentage at Take Profit: {settings['sell_percentage']}%\n"
+                f"Max Slippage: {settings['max_slippage']}%"
+            )
+            
+            keyboard = [
+                [InlineKeyboardButton("Set Investment", callback_data='set_investment_prompt')],
+                [InlineKeyboardButton("Set Take Profit", callback_data='set_take_profit_prompt')],
+                [InlineKeyboardButton("Back to Main Menu", callback_data='main_menu')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
         
-        if not prompt:
-            self.statusBar().showMessage("Please describe the code you need")
+        elif callback_data == 'help':
+            help_text = (
+                "🤖 *Solana Trading Bot Help* 🤖\n\n"
+                "*How it works:*\n"
+                "1. Create a wallet or import an existing one\n"
+                "2. Add Telegram groups to monitor\n"
+                "3. Configure your trading settings\n"
+                "4. The bot will automatically trade when new tokens are posted\n\n"
+                
+                "*Commands:*\n"
+                "/start - Show main menu\n"
+                "/help - Show this help\n"
+                "/create_wallet - Create a new wallet\n"
+                "/add_group - Add a group to monitor\n"
+                "/settings - Configure trading parameters"
+            )
+            
+            keyboard = [[InlineKeyboardButton("Back to Main Menu", callback_data='main_menu')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(help_text, reply_markup=reply_markup, parse_mode='Markdown')
+        
+        elif callback_data == 'main_menu':
+            # Return to main menu
+            keyboard = [
+                [InlineKeyboardButton("Manage Wallets", callback_data='manage_wallets')],
+                [InlineKeyboardButton("Create Wallet", callback_data='create_wallet')],
+                [InlineKeyboardButton("Wallet Info", callback_data='wallet_info')],
+                [InlineKeyboardButton("Manage Groups", callback_data='manage_groups')],
+                [InlineKeyboardButton("Trading Settings", callback_data='trading_settings')],
+                [InlineKeyboardButton("Help", callback_data='help')]
+            ]
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text("Main Menu", reply_markup=reply_markup)
+        
+        elif callback_data.startswith('remove_'):
+            # Extract group link from callback data
+            group_to_remove = callback_data[7:]  # Remove 'remove_' prefix
+            
+            if group_to_remove in self.monitored_groups:
+                self.monitored_groups.remove(group_to_remove)
+                self._save_monitored_groups()
+                
+                # Remove the listener for this group
+                await self.telegram_listener.remove_group(group_to_remove)
+                
+                await query.edit_message_text(f"✅ Removed {group_to_remove} from monitored groups.")
+            else:
+                await query.edit_message_text(f"❌ Group not found in the monitored list.")
+        
+        elif callback_data == 'add_group':
+            await query.edit_message_text(
+                "Please send the Telegram group link using the /add_group command.\n"
+                "Example: /add_group https://t.me/groupname"
+            )
+        
+        elif callback_data == 'remove_group':
+            if not self.monitored_groups:
+                await query.edit_message_text("❌ No groups are currently being monitored.")
+                return
+            
+            keyboard = []
+            for group in self.monitored_groups:
+                keyboard.append([InlineKeyboardButton(group, callback_data=f"remove_{group}")])
+            
+            keyboard.append([InlineKeyboardButton("Back", callback_data='manage_groups')])
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text("Select a group to remove:", reply_markup=reply_markup)
+        
+        elif callback_data == 'list_groups':
+            if not self.monitored_groups:
+                text = "⚠️ No groups are currently being monitored."
+            else:
+                text = "📋 *Monitored Groups:*\n\n"
+                for i, group in enumerate(self.monitored_groups, 1):
+                    text += f"{i}. {group}\n"
+            
+            keyboard = [[InlineKeyboardButton("Back", callback_data='manage_groups')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+        
+        elif callback_data == 'set_investment_prompt':
+            await query.edit_message_text(
+                "Please enter the initial investment amount using the /set_investment command.\n"
+                "Example: /set_investment 0.5"
+            )
+        
+        elif callback_data == 'set_take_profit_prompt':
+            await query.edit_message_text(
+                "Please set the take profit conditions using the /set_take_profit command.\n"
+                "Format: /set_take_profit <profit_percentage> <sell_percentage>\n"
+                "Example: /set_take_profit 30 50 - Sell 50% when profit reaches 30%"
+            )
+
+    async def text_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle text messages that aren't commands."""
+        await update.message.reply_text(
+            "I don't understand that message. Use /help to see available commands."
+        )
+
+    async def error_handler(self, update, context):
+        """Handle errors."""
+        # Log the error
+        logger.error(f"Update {update} caused error {context.error}")
+    
+        # Check if the update has a message or a callback query
+        if update and update.message:
+            # If the update is a message, reply to the user via the message
+            await update.message.reply_text(
+                "❌ An error occurred. Please try again later."
+            )
+        elif update and update.callback_query:
+            # If the update is a callback query, reply via the callback query
+            await update.callback_query.answer(
+                "❌ An error occurred. Please try again later.", show_alert=True
+            )
+        else:
+            # If there's no clear way to respond, log it
+            logger.warning("Error occurred, but no valid update object to reply to.")
+
+    async def process_new_ca(self, ca_address, group_name):
+        """Process a new crypto address found in a monitored group."""
+        logger.info(f"New CA detected: {ca_address} from {group_name}")
+        
+        # Check if this token has already been traded
+        if ca_address in self.trading_settings['traded_tokens']:
+            logger.info(f"Token {ca_address} has already been traded. Skipping.")
             return
         
-        self.statusBar().showMessage("Generating code...")
-        self.generate_button.setEnabled(False)
+        # Execute trade
+        trade_result = await self.solana_trader.buy_token(
+            ca_address, 
+            self.trading_settings['initial_investment'],
+            self.trading_settings['max_slippage']
+        )
         
-        # Enhance system prompt with language preference
-        enhanced_prompt = f"{self.system_prompt}\nGenerate code in {language} programming language."
-        
-        # Start thread to generate code
-        self.code_gen_thread = CodeGenerationThread(prompt, enhanced_prompt)
-        self.code_gen_thread.response_ready.connect(self.update_generated_code)
-        self.code_gen_thread.start()
-    
-    def update_generated_code(self, response):
-        self.gen_output.setText(response)
-        self.statusBar().showMessage("Code generated")
-        self.generate_button.setEnabled(True)
-    
-    def copy_code(self):
-        response = self.output_text.toPlainText()
-        if response:
-            # Extract code blocks if they exist
-            if "```" in response:
-                start = response.find("```") + 3
-                # Skip the language identifier if present
-                if not response[start:].startswith("\n"):
-                    start = response.find("\n", start) + 1
-                end = response.find("```", start)
-                if end > start:
-                    code_only = response[start:end].strip()
-                    pyperclip.copy(code_only)
-                    self.statusBar().showMessage("Code copied to clipboard!", 3000)
-                    return
+        if trade_result['success']:
+            # Add to traded tokens list
+            self.trading_settings['traded_tokens'].append(ca_address)
+            self._save_trading_settings()
             
-            # If no code block, copy the whole response
-            pyperclip.copy(response)
-            self.statusBar().showMessage("Response copied to clipboard!", 3000)
-    
-    def copy_all(self):
-        response = self.output_text.toPlainText()
-        if response:
-            pyperclip.copy(response)
-            self.statusBar().showMessage("Full response copied to clipboard!", 3000)
-    
-    def copy_generated_code(self):
-        response = self.gen_output.toPlainText()
-        if response:
-            # Extract code blocks if they exist
-            if "```" in response:
-                start = response.find("```") + 3
-                # Skip the language identifier if present
-                if not response[start:].startswith("\n"):
-                    start = response.find("\n", start) + 1
-                end = response.find("```", start)
-                if end > start:
-                    code_only = response[start:end].strip()
-                    pyperclip.copy(code_only)
-                    self.statusBar().showMessage("Generated code copied to clipboard!", 3000)
-                    return
+            # Start monitoring for take profit
+            asyncio.create_task(self.monitor_token_price(
+                ca_address,
+                trade_result['price'],
+                trade_result['amount']
+            ))
             
-            # If no code block, copy the whole response
-            pyperclip.copy(response)
-            self.statusBar().showMessage("Generated code copied to clipboard!", 3000)
-    
-    def apply_to_editor(self):
-        # Extract code from response
-        response = self.output_text.toPlainText()
-        if not response:
-            return
-            
-        # Get code from response
-        code = ""
-        if "```" in response:
-            start = response.find("```") + 3
-            # Skip the language identifier if present
-            if not response[start:].startswith("\n"):
-                start = response.find("\n", start) + 1
-            end = response.find("```", start)
-            if end > start:
-                code = response[start:end].strip()
+            # Notify user about successful trade
+            await self.notify_user(
+                f"🚀 *New Token Trade*\n\n"
+                f"Token: `{ca_address}`\n"
+                f"Group: {group_name}\n"
+                f"Amount: {self.trading_settings['initial_investment']} SOL\n"
+                f"Tokens purchased: {trade_result['amount']}\n"
+                f"Entry price: {trade_result['price']} SOL per token\n\n"
+                f"Now monitoring for take profit at {self.trading_settings['take_profit_percentage']}%"
+            )
         else:
-            code = response
+            # Notify about failed trade
+            await self.notify_user(
+                f"⚠️ *Trade Failed*\n\n"
+                f"Token: `{ca_address}`\n"
+                f"Group: {group_name}\n"
+                f"Error: {trade_result['error']}"
+            )
+
+    async def monitor_token_price(self, token_address, entry_price, token_amount):
+        """Monitor token price and execute take profit if conditions are met."""
+        take_profit_price = entry_price * (1 + self.trading_settings['take_profit_percentage'] / 100)
+        sell_amount = token_amount * (self.trading_settings['sell_percentage'] / 100)
         
-        # Copy to clipboard
-        pyperclip.copy(code)
+        logger.info(f"Starting price monitoring for {token_address}")
+        logger.info(f"Entry price: {entry_price}, Take profit price: {take_profit_price}")
         
-        # Simulate paste at cursor position
-        keyboard.send('ctrl+v')
-        self.statusBar().showMessage("Code applied to editor", 3000)
-    
-    def insert_at_cursor(self):
-        # Extract code from generated output
-        response = self.gen_output.toPlainText()
-        if not response:
-            return
+        # Keep monitoring until take profit is reached or max monitoring time passed
+        max_monitoring_time = 60 * 60 * 24  # 24 hours
+        monitoring_interval = 60  # Check every 60 seconds
+        elapsed_time = 0
+        
+        while elapsed_time < max_monitoring_time:
+            # Get current price
+            current_price = await self.solana_trader.get_token_price(token_address)
             
-        # Get code from response
-        code = ""
-        if "```" in response:
-            start = response.find("```") + 3
-            # Skip the language identifier if present
-            if not response[start:].startswith("\n"):
-                start = response.find("\n", start) + 1
-            end = response.find("```", start)
-            if end > start:
-                code = response[start:end].strip()
-        else:
-            code = response
-        
-        # Copy to clipboard
-        pyperclip.copy(code)
-        
-        # Simulate paste at cursor position
-        keyboard.send('ctrl+v')
-        self.statusBar().showMessage("Code inserted at cursor", 3000)
-    
-    def refresh_from_clipboard(self):
-        clipboard_content = pyperclip.paste()
-        if clipboard_content:
-            self.code_context.setText(clipboard_content)
-            self.statusBar().showMessage("Code context updated from clipboard", 3000)
-    
-    def copy_selection(self):
-        # Get the currently focused widget
-        focused_widget = QApplication.focusWidget()
-        
-        # If it's a text edit widget, copy the selection
-        if isinstance(focused_widget, QTextEdit) or isinstance(focused_widget, QLineEdit):
-            focused_widget.copy()
-    
-    def paste_clipboard(self):
-        # Get the currently focused widget
-        focused_widget = QApplication.focusWidget()
-        
-        # If it's a text edit widget, paste from clipboard
-        if isinstance(focused_widget, QTextEdit) or isinstance(focused_widget, QLineEdit):
-            focused_widget.paste()
-    
-    def clear_fields(self):
-        self.code_context.clear()
-        self.prompt_input.clear()
-        self.output_text.clear()
-        self.gen_prompt.clear()
-        self.gen_output.clear()
-        self.statusBar().showMessage("Ready")
-    
-    def toggle_always_on_top(self, state):
-        if state:
-            self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        else:
-            self.setWindowFlag(Qt.WindowStaysOnTopHint, False)
-        self.show()
-    
-    def show_about(self):
-        about_text = """
-        <h2>VivirAI Coder</h2>
-        <p>An AI-powered coding assistant.</p>
-        <p>Version 1.0</p>
-        <p>© 2025 VivirAI</p>
-        """
-        QMessageBox.about(self, "About VivirAI Coder", about_text)
-    
-    def close_application(self):
-        # Stop the screen monitoring thread
-        if hasattr(self, 'screen_monitor'):
-            self.screen_monitor.stop()
-            self.screen_monitor.wait()
-        
-        # Close the application
-        self.close()
-        QApplication.quit()
-    
-    def closeEvent(self, event):
-        # Override close event to handle proper shutdown
-        self.close_application()
-        event.accept()
+            if current_price >= take_profit_price:
+                # Execute take profit
+                sell_result = await self.solana_trader.sell_token(
+                    token_address,
+                    sell_amount,
+                    self.trading_settings['max_slippage']
+                )
+                
+                if sell_result['success']:
+                    # Calculate profit
+                    profit = (sell_result['price'] - entry_price) * sell_amount
+                    profit_percentage = ((sell_result['price'] / entry_price) - 1) * 100
+                    
+                    # Notify user
+                    await self.notify_user(
+                        f"💰 *Take Profit Executed*\n\n"
+                        f"Token: `{token_address}`\n"
+                        f"Sold: {sell_amount} tokens ({self.trading_settings['sell_percentage']}% of position)\n"
+                        f"Entry price: {entry_price} SOL\n"
+                        f"Exit price: {sell_result['price']} SOL\n"
+                        f"Profit: {profit:.4f} SOL ({profit_percentage:.2f}%)"
+                    )
+                    
+                    # If we sold 100%, stop monitoring
+                    if self.trading_settings['sell_percentage'] >= 100:
+                        return
+                    
+                    # Update monitoring parameters for the remaining position
+                    token_amount -= sell_amount
+                    take_profit_price = sell_result['price'] * 1.1  # New take profit at +10% from current
+                else:
+                    # Notify about failed sell
+                    await self.notify_user(
+                        f"⚠️ *Take Profit Failed*\n\n"
+                        f"Token: `{token_address}`\n"
+                        f"Error: {sell_result['error']}"
+                    )
+            
+            # Wait before next check
+            await asyncio.sleep(monitoring_interval)
+            elapsed_time += monitoring_interval
+
+    async def notify_user(self, message):
+        """Notify the user about important events."""
+        # In a production app, we would store the user's chat ID and send messages there
+        # For now, we'll use a broadcast approach (sends to all users who have interacted with the bot)
+        async for update in self.telegram_bot.updater.update_queue:
+            if update.effective_chat:
+                await self.telegram_bot.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=message,
+                    parse_mode='Markdown'
+                )
+                break
+
+    async def run(self):
+        """Run the bot."""
+        # Start the Telegram listener
+        await self.telegram_listener.start(self.monitored_groups)
+
+        # Start polling and block until stopped
+        await self.telegram_bot.run_polling()
+
+        logger.info("Bot started!")
+
+
+async def main():
+    """Main function."""
+    bot = TradingBot()
+    await bot.run()
+
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    app.setStyle('Fusion')  # Use Fusion style for consistent look across platforms
-    
-    # Check if Ollama is running
-    try:
-        ollama.list()
-        window = VivirAICoder()
-        window.show()
-        sys.exit(app.exec_())
-    except Exception as e:
-        error_dialog = QMessageBox()
-        error_dialog.setIcon(QMessageBox.Critical)
-        error_dialog.setWindowTitle("Error")
-        error_dialog.setText("Could not connect to Ollama")
-        error_dialog.setInformativeText(f"Please make sure Ollama is installed and running.\n\nError: {str(e)}")
-        error_dialog.setDetailedText("This application requires Ollama to be installed and running. Please visit https://ollama.ai to download and install Ollama.")
-        error_dialog.exec_()
-        sys.exit(1)
+    asyncio.run(main())
