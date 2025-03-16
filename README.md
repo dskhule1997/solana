@@ -39,9 +39,9 @@ pip install -r requirements.txt
 1. Create a `credentials.txt` file with the following content:
 
 ```
-api_id=21354073
-api_hash=bb5ca0d1d8173f82a5f3360d9a6d7e30
-bot_token=8080183199:AAE-cAuz10YR6k9JgvkErUo5fwljmiQnN54
+api_id=
+api_hash=
+bot_token=
 ```
 
 Replace the values with your actual credentials if they differ.
@@ -49,8 +49,8 @@ Replace the values with your actual credentials if they differ.
 2. Create an initial `monitored_groups.txt` file (optional):
 
 ```
-https://t.me/SeekrTrending
-https://t.me/onchain_meme
+https://t.me/
+https://t.me/
 ```
 
 ### Running the Bot
