@@ -6,6 +6,8 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 from telethon import TelegramClient, events
 from telethon.tl.types import Channel
+import nest_asyncio
+nest_asyncio.apply()
 
 # Local imports
 from telegram_listener import TelegramListener
@@ -409,15 +411,35 @@ class TradingBot:
             await update.message.reply_text("❌ Invalid values. Please provide valid numbers.")
 
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle button callbacks."""
         query = update.callback_query
         await query.answer()
-        
+    
         callback_data = query.data
-        
+    
+                # In button_handler method
+            # In button_handler method
         if callback_data == 'create_wallet':
-            await self.create_wallet(update, context)
-        
+            # Create new wallet
+            wallet_info = self.solana_trader.create_new_wallet()
+            
+            if wallet_info:
+                # Only show part of the private key for security
+                private_key = wallet_info['private_key']
+                safe_private_key = f"{private_key[:5]}...{private_key[-5:]}"
+                
+                response = (
+                    "✅ New wallet created successfully!\n\n"
+                    f"🔑 Public Address: `{wallet_info['public_key']}`\n\n"
+                    f"🔐 Private Key: `{safe_private_key}`\n\n"
+                    "⚠️ *IMPORTANT:* Your full private key has been saved in the wallet_credentials.txt file. "
+                    "Keep this file secure and do not share it with anyone!"
+                )
+                
+                await query.edit_message_text(response, parse_mode='Markdown')
+            else:
+                await query.edit_message_text("❌ Failed to create a new wallet. Please try again later.")
+                
+            
         elif callback_data == 'wallet_info':
             await self.wallet_info_command(update, context)
         
@@ -553,15 +575,25 @@ class TradingBot:
             "I don't understand that message. Use /help to see available commands."
         )
 
-    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def error_handler(self, update, context):
         """Handle errors."""
+        # Log the error
         logger.error(f"Update {update} caused error {context.error}")
-        
-        # Send message to the user
-        if update:
+    
+        # Check if the update has a message or a callback query
+        if update and update.message:
+            # If the update is a message, reply to the user via the message
             await update.message.reply_text(
                 "❌ An error occurred. Please try again later."
             )
+        elif update and update.callback_query:
+            # If the update is a callback query, reply via the callback query
+            await update.callback_query.answer(
+                "❌ An error occurred. Please try again later.", show_alert=True
+            )
+        else:
+            # If there's no clear way to respond, log it
+            logger.warning("Error occurred, but no valid update object to reply to.")
 
     async def process_new_ca(self, ca_address, group_name):
         """Process a new crypto address found in a monitored group."""
@@ -686,23 +718,11 @@ class TradingBot:
         """Run the bot."""
         # Start the Telegram listener
         await self.telegram_listener.start(self.monitored_groups)
-        
-        # Start the bot
-        await self.telegram_bot.initialize()
-        await self.telegram_bot.start_polling()
-        await self.telegram_bot.updater.start_polling()
-        
+
+        # Start polling and block until stopped
+        await self.telegram_bot.run_polling()
+
         logger.info("Bot started!")
-        
-        # Keep the bot running
-        try:
-            await self.telegram_bot.idle()
-        finally:
-            # Cleanup
-            # Cleanup
-            await self.telegram_bot.stop()
-            await self.telegram_bot.shutdown()
-            await self.telegram_listener.stop()
 
 
 async def main():
