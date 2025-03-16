@@ -249,28 +249,41 @@ class TradingBot:
 
     async def manage_wallets(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Show wallet management options."""
-        query = update.callback_query  # Get the callback query
-        await query.answer()  # Acknowledge the callback query
+        query = update.callback_query
+        await query.answer()
 
         keyboard = []
+        message_text = "🔑 *Wallet Management*\n\n"
         
-        # Add button for each wallet
+        # Go through each wallet and get its balance
         for i, wallet in enumerate(self.wallets['wallets']):
+            # Get the wallet's name or create a default name
             wallet_name = wallet.get('name', f"Wallet {i+1}")
+            
+            # Create a temporary SolanaTrader to get the balance
+            temp_trader = SolanaTrader(wallet)
+            balance = await temp_trader.get_balance()
+            
+            # Add wallet info to the message
             active_marker = "✅ " if i == self.wallets['active_wallet_index'] else ""
+            message_text += f"{active_marker}{wallet_name}\n"
+            message_text += f"Address: {wallet['public_key'][:6]}...{wallet['public_key'][-4:]}\n"
+            message_text += f"Balance: {balance} SOL\n\n"
+            
+            # Add button for this wallet
             keyboard.append([InlineKeyboardButton(
-                f"{active_marker}{wallet_name}", 
+                f"{active_marker}{wallet_name} ({balance} SOL)", 
                 callback_data=f"select_wallet_{i}"
             )])
         
-        # Add button to create new wallet
+        # Add other management buttons
         keyboard.append([InlineKeyboardButton("➕ Create New Wallet", callback_data="create_wallet")])
         keyboard.append([InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")])
         
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(
-            "🔑 *Wallet Management*\n\nSelect a wallet to use or create a new one:",
+            message_text,
             reply_markup=reply_markup,
             parse_mode='Markdown'
     )
