@@ -1,0 +1,715 @@
+import logging
+import asyncio
+import json
+import os
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+from telethon import TelegramClient, events
+from telethon.tl.types import Channel
+
+# Local imports
+from telegram_listener import TelegramListener
+from solana_trader import SolanaTrader
+
+# Set up logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Conversation states
+SETUP, ADDING_GROUP, REMOVING_GROUP, SETTING_INVESTMENT, SETTING_TAKE_PROFIT = range(5)
+
+class TradingBot:
+    def __init__(self):
+        # Load credentials
+        self.credentials = self._load_credentials()
+        self.wallet_info = self._load_wallet_info()
+        self.monitored_groups = self._load_monitored_groups()
+        self.trading_settings = self._load_trading_settings()
+        
+        # Initialize components
+        self.solana_trader = SolanaTrader(self.wallet_info, self.trading_settings)
+        
+        # Create the telegram listener
+        self.telegram_listener = TelegramListener(
+            api_id=self.credentials['api_id'],
+            api_hash=self.credentials['api_hash'],
+            bot_token=self.credentials['bot_token'],
+            callback=self.process_new_ca
+        )
+        
+        # Initialize the telegram bot
+        self.telegram_bot = Application.builder().token(self.credentials['bot_token']).build()
+        self._setup_handlers()
+
+    def _load_credentials(self):
+        try:
+            with open('credentials.txt', 'r') as f:
+                creds = {}
+                for line in f:
+                    if '=' in line:
+                        key, value = line.strip().split('=', 1)
+                        creds[key.strip()] = value.strip().strip("'").strip('"')
+                return creds
+        except FileNotFoundError:
+            logger.error("Credentials file not found. Please create a credentials.txt file.")
+            return {
+                'api_id': '',
+                'api_hash': '',
+                'bot_token': ''
+            }
+
+    def _load_wallet_info(self):
+        try:
+            with open('wallet_credentials.txt', 'r') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+
+    def _save_wallet_info(self, wallet_info):
+        with open('wallet_credentials.txt', 'w') as f:
+            json.dump(wallet_info, f)
+        self.wallet_info = wallet_info
+
+    def _load_monitored_groups(self):
+        try:
+            with open('monitored_groups.txt', 'r') as f:
+                return [line.strip() for line in f if line.strip()]
+        except FileNotFoundError:
+            return []
+
+    def _save_monitored_groups(self):
+        with open('monitored_groups.txt', 'w') as f:
+            for group in self.monitored_groups:
+                f.write(f"{group}\n")
+
+    def _load_trading_settings(self):
+        try:
+            with open('trading_settings.json', 'r') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            # Default settings
+            default_settings = {
+                'initial_investment': 0.1,  # SOL
+                'take_profit_percentage': 30,  # %
+                'sell_percentage': 50,  # %
+                'max_slippage': 1,  # %
+                'traded_tokens': []  # List of already traded token addresses
+            }
+            with open('trading_settings.json', 'w') as f:
+                json.dump(default_settings, f)
+            return default_settings
+
+    def _save_trading_settings(self):
+        with open('trading_settings.json', 'w') as f:
+            json.dump(self.trading_settings, f)
+
+    def _setup_handlers(self):
+        # Command handlers
+        self.telegram_bot.add_handler(CommandHandler("start", self.start))
+        self.telegram_bot.add_handler(CommandHandler("help", self.help_command))
+        self.telegram_bot.add_handler(CommandHandler("create_wallet", self.create_wallet))
+        self.telegram_bot.add_handler(CommandHandler("wallet_info", self.wallet_info_command))
+        self.telegram_bot.add_handler(CommandHandler("withdraw", self.withdraw))
+        self.telegram_bot.add_handler(CommandHandler("add_group", self.add_group))
+        self.telegram_bot.add_handler(CommandHandler("remove_group", self.remove_group))
+        self.telegram_bot.add_handler(CommandHandler("list_groups", self.list_groups))
+        self.telegram_bot.add_handler(CommandHandler("settings", self.show_settings))
+        self.telegram_bot.add_handler(CommandHandler("set_investment", self.set_investment))
+        self.telegram_bot.add_handler(CommandHandler("set_take_profit", self.set_take_profit))
+        
+        # Callback query handler
+        self.telegram_bot.add_handler(CallbackQueryHandler(self.button_handler))
+        
+        # Conversation handlers for more complex flows
+        self.telegram_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.text_handler))
+        
+        # Error handler
+        self.telegram_bot.add_error_handler(self.error_handler)
+
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Send a message when the command /start is issued."""
+        user = update.effective_user
+        
+        welcome_text = (
+            f"Hi {user.first_name}! I'm your Solana Trading Bot.\n\n"
+            "I can monitor Telegram groups for new Solana tokens and trade them automatically."
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton("Create Wallet", callback_data='create_wallet')],
+            [InlineKeyboardButton("Wallet Info", callback_data='wallet_info')],
+            [InlineKeyboardButton("Manage Groups", callback_data='manage_groups')],
+            [InlineKeyboardButton("Trading Settings", callback_data='trading_settings')],
+            [InlineKeyboardButton("Help", callback_data='help')]
+        ]
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(welcome_text, reply_markup=reply_markup)
+
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Send a message when the command /help is issued."""
+        help_text = (
+            "🤖 *Solana Trading Bot Commands* 🤖\n\n"
+            "*Wallet Commands:*\n"
+            "/create_wallet - Generate a new Solana wallet\n"
+            "/wallet_info - Display your current wallet info\n"
+            "/withdraw <amount> <address> - Withdraw funds to another wallet\n\n"
+            
+            "*Group Management:*\n"
+            "/add_group <group_link> - Add a Telegram group to monitor\n"
+            "/remove_group - Shows a list of groups to remove\n"
+            "/list_groups - List all monitored groups\n\n"
+            
+            "*Trading Settings:*\n"
+            "/settings - View current trading settings\n"
+            "/set_investment <amount> - Set initial investment amount in SOL\n"
+            "/set_take_profit <profit_percentage> <sell_percentage> - Set take profit conditions\n"
+            "Example: /set_take_profit 30 50 - Sell 50% when profit reaches 30%\n\n"
+            
+            "*Other Commands:*\n"
+            "/start - Show the main menu\n"
+            "/help - Display this help message"
+        )
+        
+        await update.message.reply_text(help_text, parse_mode='Markdown')
+
+    async def create_wallet(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Create a new Solana wallet."""
+        # Generate a new wallet using the SolanaTrader
+        new_wallet = self.solana_trader.create_new_wallet()
+        
+        if new_wallet:
+            self._save_wallet_info(new_wallet)
+            
+            # Only show part of the private key for security
+            private_key = new_wallet['private_key']
+            safe_private_key = f"{private_key[:5]}...{private_key[-5:]}"
+            
+            response = (
+                "✅ New wallet created successfully!\n\n"
+                f"🔑 Public Address: `{new_wallet['public_key']}`\n\n"
+                f"🔐 Private Key: `{safe_private_key}`\n\n"
+                "⚠️ *IMPORTANT:* Your full private key has been saved in the wallet_credentials.txt file. "
+                "Keep this file secure and do not share it with anyone!"
+            )
+        else:
+            response = "❌ Failed to create a new wallet. Please try again later."
+        
+        await update.message.reply_text(response, parse_mode='Markdown')
+
+    async def wallet_info_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Display wallet information."""
+        if not self.wallet_info:
+            await update.message.reply_text(
+                "❌ No wallet configured. Use /create_wallet to create a new one."
+            )
+            return
+        
+        # Get current balance
+        balance = await self.solana_trader.get_balance()
+        
+        # Only show part of the private key for security
+        private_key = self.wallet_info['private_key']
+        safe_private_key = f"{private_key[:5]}...{private_key[-5:]}"
+        
+        response = (
+            "🔑 *Wallet Information*\n\n"
+            f"Public Address: `{self.wallet_info['public_key']}`\n\n"
+            f"Private Key: `{safe_private_key}`\n\n"
+            f"Balance: {balance} SOL"
+        )
+        
+        await update.message.reply_text(response, parse_mode='Markdown')
+
+    async def withdraw(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Withdraw funds to another wallet."""
+        if not self.wallet_info:
+            await update.message.reply_text(
+                "❌ No wallet configured. Use /create_wallet to create a new one."
+            )
+            return
+        
+        if len(context.args) != 2:
+            await update.message.reply_text(
+                "❌ Please use the format: /withdraw <amount> <destination_address>"
+            )
+            return
+        
+        try:
+            amount = float(context.args[0])
+            destination = context.args[1]
+            
+            # Validate the amount and destination
+            if amount <= 0:
+                await update.message.reply_text("❌ Amount must be greater than 0.")
+                return
+            
+            # Send the transaction
+            result = await self.solana_trader.withdraw(amount, destination)
+            
+            if result['success']:
+                response = (
+                    "✅ Withdrawal successful!\n\n"
+                    f"Amount: {amount} SOL\n"
+                    f"Destination: {destination}\n"
+                    f"Transaction signature: {result['signature']}"
+                )
+            else:
+                response = f"❌ Withdrawal failed: {result['error']}"
+                
+            await update.message.reply_text(response)
+            
+        except ValueError:
+            await update.message.reply_text("❌ Invalid amount. Please provide a valid number.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {str(e)}")
+
+    async def add_group(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Add a Telegram group to monitor."""
+        if len(context.args) != 1:
+            await update.message.reply_text(
+                "❌ Please provide the group link.\n"
+                "Example: /add_group https://t.me/groupname"
+            )
+            return
+        
+        group_link = context.args[0]
+        
+        # Validate the group link
+        if not group_link.startswith("https://t.me/"):
+            await update.message.reply_text(
+                "❌ Invalid group link. It should start with https://t.me/"
+            )
+            return
+        
+        # Add to the list if not already there
+        if group_link not in self.monitored_groups:
+            self.monitored_groups.append(group_link)
+            self._save_monitored_groups()
+            
+            # Add the listener for this group
+            await self.telegram_listener.add_group(group_link)
+            
+            response = f"✅ Successfully added {group_link} to monitored groups."
+        else:
+            response = f"⚠️ {group_link} is already being monitored."
+        
+        await update.message.reply_text(response)
+
+    async def remove_group(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show groups to remove with inline buttons."""
+        if not self.monitored_groups:
+            await update.message.reply_text("❌ No groups are currently being monitored.")
+            return
+        
+        keyboard = []
+        for group in self.monitored_groups:
+            keyboard.append([InlineKeyboardButton(group, callback_data=f"remove_{group}")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "Select a group to remove:",
+            reply_markup=reply_markup
+        )
+
+    async def list_groups(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """List all monitored groups."""
+        if not self.monitored_groups:
+            await update.message.reply_text("⚠️ No groups are currently being monitored.")
+            return
+        
+        response = "📋 *Monitored Groups:*\n\n"
+        for i, group in enumerate(self.monitored_groups, 1):
+            response += f"{i}. {group}\n"
+        
+        await update.message.reply_text(response, parse_mode='Markdown')
+
+    async def show_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show current trading settings."""
+        settings = self.trading_settings
+        
+        response = (
+            "⚙️ *Trading Settings*\n\n"
+            f"Initial Investment: {settings['initial_investment']} SOL\n"
+            f"Take Profit: {settings['take_profit_percentage']}%\n"
+            f"Sell Percentage: {settings['sell_percentage']}%\n"
+            f"Max Slippage: {settings['max_slippage']}%\n\n"
+            f"Tokens Traded: {len(settings['traded_tokens'])}"
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton("Set Investment", callback_data='set_investment')],
+            [InlineKeyboardButton("Set Take Profit", callback_data='set_take_profit')],
+            [InlineKeyboardButton("Main Menu", callback_data='main_menu')]
+        ]
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(response, reply_markup=reply_markup, parse_mode='Markdown')
+
+    async def set_investment(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Set the initial investment amount."""
+        if len(context.args) != 1:
+            await update.message.reply_text(
+                "❌ Please provide the investment amount in SOL.\n"
+                "Example: /set_investment 0.5"
+            )
+            return
+        
+        try:
+            amount = float(context.args[0])
+            
+            if amount <= 0:
+                await update.message.reply_text("❌ Amount must be greater than 0.")
+                return
+            
+            self.trading_settings['initial_investment'] = amount
+            self._save_trading_settings()
+            
+            await update.message.reply_text(f"✅ Initial investment amount set to {amount} SOL.")
+            
+        except ValueError:
+            await update.message.reply_text("❌ Invalid amount. Please provide a valid number.")
+
+    async def set_take_profit(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Set the take profit conditions."""
+        if len(context.args) != 2:
+            await update.message.reply_text(
+                "❌ Please provide both profit percentage and sell percentage.\n"
+                "Example: /set_take_profit 30 50"
+            )
+            return
+        
+        try:
+            profit_percentage = float(context.args[0])
+            sell_percentage = float(context.args[1])
+            
+            if profit_percentage <= 0 or sell_percentage <= 0 or sell_percentage > 100:
+                await update.message.reply_text(
+                    "❌ Invalid values. Profit percentage must be greater than 0, "
+                    "and sell percentage must be between 0 and 100."
+                )
+                return
+            
+            self.trading_settings['take_profit_percentage'] = profit_percentage
+            self.trading_settings['sell_percentage'] = sell_percentage
+            self._save_trading_settings()
+            
+            await update.message.reply_text(
+                f"✅ Take profit settings updated:\n"
+                f"- Sell {sell_percentage}% of tokens when profit reaches {profit_percentage}%"
+            )
+            
+        except ValueError:
+            await update.message.reply_text("❌ Invalid values. Please provide valid numbers.")
+
+    async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle button callbacks."""
+        query = update.callback_query
+        await query.answer()
+        
+        callback_data = query.data
+        
+        if callback_data == 'create_wallet':
+            await self.create_wallet(update, context)
+        
+        elif callback_data == 'wallet_info':
+            await self.wallet_info_command(update, context)
+        
+        elif callback_data == 'manage_groups':
+            keyboard = [
+                [InlineKeyboardButton("Add Group", callback_data='add_group')],
+                [InlineKeyboardButton("Remove Group", callback_data='remove_group')],
+                [InlineKeyboardButton("List Groups", callback_data='list_groups')],
+                [InlineKeyboardButton("Back to Main Menu", callback_data='main_menu')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("📋 Group Management", reply_markup=reply_markup)
+        
+        elif callback_data == 'trading_settings':
+            settings = self.trading_settings
+            text = (
+                "⚙️ *Trading Settings*\n\n"
+                f"Initial Investment: {settings['initial_investment']} SOL\n"
+                f"Take Profit: {settings['take_profit_percentage']}%\n"
+                f"Sell Percentage at Take Profit: {settings['sell_percentage']}%\n"
+                f"Max Slippage: {settings['max_slippage']}%"
+            )
+            
+            keyboard = [
+                [InlineKeyboardButton("Set Investment", callback_data='set_investment_prompt')],
+                [InlineKeyboardButton("Set Take Profit", callback_data='set_take_profit_prompt')],
+                [InlineKeyboardButton("Back to Main Menu", callback_data='main_menu')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+        
+        elif callback_data == 'help':
+            help_text = (
+                "🤖 *Solana Trading Bot Help* 🤖\n\n"
+                "*How it works:*\n"
+                "1. Create a wallet or import an existing one\n"
+                "2. Add Telegram groups to monitor\n"
+                "3. Configure your trading settings\n"
+                "4. The bot will automatically trade when new tokens are posted\n\n"
+                
+                "*Commands:*\n"
+                "/start - Show main menu\n"
+                "/help - Show this help\n"
+                "/create_wallet - Create a new wallet\n"
+                "/add_group - Add a group to monitor\n"
+                "/settings - Configure trading parameters"
+            )
+            
+            keyboard = [[InlineKeyboardButton("Back to Main Menu", callback_data='main_menu')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(help_text, reply_markup=reply_markup, parse_mode='Markdown')
+        
+        elif callback_data == 'main_menu':
+            # Return to main menu
+            keyboard = [
+                [InlineKeyboardButton("Create Wallet", callback_data='create_wallet')],
+                [InlineKeyboardButton("Wallet Info", callback_data='wallet_info')],
+                [InlineKeyboardButton("Manage Groups", callback_data='manage_groups')],
+                [InlineKeyboardButton("Trading Settings", callback_data='trading_settings')],
+                [InlineKeyboardButton("Help", callback_data='help')]
+            ]
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text("Main Menu", reply_markup=reply_markup)
+        
+        elif callback_data.startswith('remove_'):
+            # Extract group link from callback data
+            group_to_remove = callback_data[7:]  # Remove 'remove_' prefix
+            
+            if group_to_remove in self.monitored_groups:
+                self.monitored_groups.remove(group_to_remove)
+                self._save_monitored_groups()
+                
+                # Remove the listener for this group
+                await self.telegram_listener.remove_group(group_to_remove)
+                
+                await query.edit_message_text(f"✅ Removed {group_to_remove} from monitored groups.")
+            else:
+                await query.edit_message_text(f"❌ Group not found in the monitored list.")
+        
+        elif callback_data == 'add_group':
+            await query.edit_message_text(
+                "Please send the Telegram group link using the /add_group command.\n"
+                "Example: /add_group https://t.me/groupname"
+            )
+        
+        elif callback_data == 'remove_group':
+            if not self.monitored_groups:
+                await query.edit_message_text("❌ No groups are currently being monitored.")
+                return
+            
+            keyboard = []
+            for group in self.monitored_groups:
+                keyboard.append([InlineKeyboardButton(group, callback_data=f"remove_{group}")])
+            
+            keyboard.append([InlineKeyboardButton("Back", callback_data='manage_groups')])
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text("Select a group to remove:", reply_markup=reply_markup)
+        
+        elif callback_data == 'list_groups':
+            if not self.monitored_groups:
+                text = "⚠️ No groups are currently being monitored."
+            else:
+                text = "📋 *Monitored Groups:*\n\n"
+                for i, group in enumerate(self.monitored_groups, 1):
+                    text += f"{i}. {group}\n"
+            
+            keyboard = [[InlineKeyboardButton("Back", callback_data='manage_groups')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+        
+        elif callback_data == 'set_investment_prompt':
+            await query.edit_message_text(
+                "Please enter the initial investment amount using the /set_investment command.\n"
+                "Example: /set_investment 0.5"
+            )
+        
+        elif callback_data == 'set_take_profit_prompt':
+            await query.edit_message_text(
+                "Please set the take profit conditions using the /set_take_profit command.\n"
+                "Format: /set_take_profit <profit_percentage> <sell_percentage>\n"
+                "Example: /set_take_profit 30 50 - Sell 50% when profit reaches 30%"
+            )
+
+    async def text_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle text messages that aren't commands."""
+        await update.message.reply_text(
+            "I don't understand that message. Use /help to see available commands."
+        )
+
+    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle errors."""
+        logger.error(f"Update {update} caused error {context.error}")
+        
+        # Send message to the user
+        if update:
+            await update.message.reply_text(
+                "❌ An error occurred. Please try again later."
+            )
+
+    async def process_new_ca(self, ca_address, group_name):
+        """Process a new crypto address found in a monitored group."""
+        logger.info(f"New CA detected: {ca_address} from {group_name}")
+        
+        # Check if this token has already been traded
+        if ca_address in self.trading_settings['traded_tokens']:
+            logger.info(f"Token {ca_address} has already been traded. Skipping.")
+            return
+        
+        # Execute trade
+        trade_result = await self.solana_trader.buy_token(
+            ca_address, 
+            self.trading_settings['initial_investment'],
+            self.trading_settings['max_slippage']
+        )
+        
+        if trade_result['success']:
+            # Add to traded tokens list
+            self.trading_settings['traded_tokens'].append(ca_address)
+            self._save_trading_settings()
+            
+            # Start monitoring for take profit
+            asyncio.create_task(self.monitor_token_price(
+                ca_address,
+                trade_result['price'],
+                trade_result['amount']
+            ))
+            
+            # Notify user about successful trade
+            await self.notify_user(
+                f"🚀 *New Token Trade*\n\n"
+                f"Token: `{ca_address}`\n"
+                f"Group: {group_name}\n"
+                f"Amount: {self.trading_settings['initial_investment']} SOL\n"
+                f"Tokens purchased: {trade_result['amount']}\n"
+                f"Entry price: {trade_result['price']} SOL per token\n\n"
+                f"Now monitoring for take profit at {self.trading_settings['take_profit_percentage']}%"
+            )
+        else:
+            # Notify about failed trade
+            await self.notify_user(
+                f"⚠️ *Trade Failed*\n\n"
+                f"Token: `{ca_address}`\n"
+                f"Group: {group_name}\n"
+                f"Error: {trade_result['error']}"
+            )
+
+    async def monitor_token_price(self, token_address, entry_price, token_amount):
+        """Monitor token price and execute take profit if conditions are met."""
+        take_profit_price = entry_price * (1 + self.trading_settings['take_profit_percentage'] / 100)
+        sell_amount = token_amount * (self.trading_settings['sell_percentage'] / 100)
+        
+        logger.info(f"Starting price monitoring for {token_address}")
+        logger.info(f"Entry price: {entry_price}, Take profit price: {take_profit_price}")
+        
+        # Keep monitoring until take profit is reached or max monitoring time passed
+        max_monitoring_time = 60 * 60 * 24  # 24 hours
+        monitoring_interval = 60  # Check every 60 seconds
+        elapsed_time = 0
+        
+        while elapsed_time < max_monitoring_time:
+            # Get current price
+            current_price = await self.solana_trader.get_token_price(token_address)
+            
+            if current_price >= take_profit_price:
+                # Execute take profit
+                sell_result = await self.solana_trader.sell_token(
+                    token_address,
+                    sell_amount,
+                    self.trading_settings['max_slippage']
+                )
+                
+                if sell_result['success']:
+                    # Calculate profit
+                    profit = (sell_result['price'] - entry_price) * sell_amount
+                    profit_percentage = ((sell_result['price'] / entry_price) - 1) * 100
+                    
+                    # Notify user
+                    await self.notify_user(
+                        f"💰 *Take Profit Executed*\n\n"
+                        f"Token: `{token_address}`\n"
+                        f"Sold: {sell_amount} tokens ({self.trading_settings['sell_percentage']}% of position)\n"
+                        f"Entry price: {entry_price} SOL\n"
+                        f"Exit price: {sell_result['price']} SOL\n"
+                        f"Profit: {profit:.4f} SOL ({profit_percentage:.2f}%)"
+                    )
+                    
+                    # If we sold 100%, stop monitoring
+                    if self.trading_settings['sell_percentage'] >= 100:
+                        return
+                    
+                    # Update monitoring parameters for the remaining position
+                    token_amount -= sell_amount
+                    take_profit_price = sell_result['price'] * 1.1  # New take profit at +10% from current
+                else:
+                    # Notify about failed sell
+                    await self.notify_user(
+                        f"⚠️ *Take Profit Failed*\n\n"
+                        f"Token: `{token_address}`\n"
+                        f"Error: {sell_result['error']}"
+                    )
+            
+            # Wait before next check
+            await asyncio.sleep(monitoring_interval)
+            elapsed_time += monitoring_interval
+
+    async def notify_user(self, message):
+        """Notify the user about important events."""
+        # In a production app, we would store the user's chat ID and send messages there
+        # For now, we'll use a broadcast approach (sends to all users who have interacted with the bot)
+        async for update in self.telegram_bot.updater.update_queue:
+            if update.effective_chat:
+                await self.telegram_bot.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=message,
+                    parse_mode='Markdown'
+                )
+                break
+
+    async def run(self):
+        """Run the bot."""
+        # Start the Telegram listener
+        await self.telegram_listener.start(self.monitored_groups)
+        
+        # Start the bot
+        await self.telegram_bot.initialize()
+        await self.telegram_bot.start_polling()
+        await self.telegram_bot.updater.start_polling()
+        
+        logger.info("Bot started!")
+        
+        # Keep the bot running
+        try:
+            await self.telegram_bot.idle()
+        finally:
+            # Cleanup
+            # Cleanup
+            await self.telegram_bot.stop()
+            await self.telegram_bot.shutdown()
+            await self.telegram_listener.stop()
+
+
+async def main():
+    """Main function."""
+    bot = TradingBot()
+    await bot.run()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
