@@ -165,6 +165,8 @@ class TradingBot:
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Send a message when the command /start is issued."""
         user = update.effective_user
+        # Store the chat ID for notifications
+        self.user_chat_id = update.effective_chat.id
         
         welcome_text = (
             f"Hi {user.first_name}! I'm your Solana Trading Bot.\n\n"
@@ -763,9 +765,20 @@ class TradingBot:
         """Process a new crypto address found in a monitored group."""
         logger.info(f"New CA detected: {ca_address} from {group_name}")
         
+        # First, notify about the new CA detection regardless of trading
+        await self.notify_user(
+            f"🔍 *New Token Detected*\n\n"
+            f"Token Address: `{ca_address}`\n"
+            f"Found in: {group_name}\n"
+        )
+        
         # Check if this token has already been traded
         if ca_address in self.trading_settings['traded_tokens']:
-            logger.info(f"Token {ca_address} has already been traded. Skipping.")
+            await self.notify_user(
+                f"ℹ️ *Trading Skipped*\n\n"
+                f"Token: `{ca_address}`\n"
+                f"Reason: Already traded previously"
+            )
             return
         
         # Execute trade
@@ -867,16 +880,17 @@ class TradingBot:
 
     async def notify_user(self, message):
         """Notify the user about important events."""
-        # In a production app, we would store the user's chat ID and send messages there
-        # For now, we'll use a broadcast approach (sends to all users who have interacted with the bot)
-        async for update in self.telegram_bot.updater.update_queue:
-            if update.effective_chat:
+        try:
+            # Get the most recent chat ID from context or configuration
+            # You should store this when the user first interacts with the bot (/start command)
+            if hasattr(self, 'user_chat_id'):
                 await self.telegram_bot.bot.send_message(
-                    chat_id=update.effective_chat.id,
+                    chat_id=self.user_chat_id,
                     text=message,
                     parse_mode='Markdown'
                 )
-                break
+        except Exception as e:
+            logger.error(f"Error sending notification: {str(e)}")
 
     async def run(self):
         """Run the bot."""
