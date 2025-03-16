@@ -249,6 +249,9 @@ class TradingBot:
 
     async def manage_wallets(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Show wallet management options."""
+        query = update.callback_query  # Get the callback query
+        await query.answer()  # Acknowledge the callback query
+
         keyboard = []
         
         # Add button for each wallet
@@ -266,14 +269,12 @@ class TradingBot:
         
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        await update.message.reply_text(
+        await query.edit_message_text(
             "🔑 *Wallet Management*\n\nSelect a wallet to use or create a new one:",
             reply_markup=reply_markup,
             parse_mode='Markdown'
-
-
     )
-
+        
     async def wallet_info_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Display wallet information."""
         if not self.wallet_info:
