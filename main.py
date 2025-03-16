@@ -249,9 +249,8 @@ class TradingBot:
         await update.message.reply_text(response, parse_mode='Markdown')
 
     async def manage_wallets(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Show wallet management options."""
-        query = update.callback_query  # Get the callback query
-        await query.answer()  # Acknowledge the callback query
+        query = update.callback_query
+        await query.answer()
 
         keyboard = []
         
@@ -260,7 +259,7 @@ class TradingBot:
             wallet_name = wallet.get('name', f"Wallet {i+1}")
             active_marker = "✅ " if i == self.wallets['active_wallet_index'] else ""
             keyboard.append([InlineKeyboardButton(
-                f"{active_marker}{wallet_name}", 
+                f"{active_marker}{wallet_name} ({wallet['public_key'][:6]}...)", 
                 callback_data=f"select_wallet_{i}"
             )])
         
@@ -271,7 +270,9 @@ class TradingBot:
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(
-            "🔑 *Wallet Management*\n\nSelect a wallet to use or create a new one:",
+            "🔑 *Wallet Management*\n\n"
+            f"Total Wallets: {len(self.wallets['wallets'])}\n"
+            "Select a wallet to make it active:",
             reply_markup=reply_markup,
             parse_mode='Markdown'
     )
@@ -521,20 +522,34 @@ class TradingBot:
             wallet_info = self.solana_trader.create_new_wallet()
             
             if wallet_info:
+                # Add name to wallet info
+                wallet_info['name'] = f"Wallet {len(self.wallets['wallets']) + 1}"
+                
+                # Add to wallets list
+                self.wallets['wallets'].append(wallet_info)
+                
+                # Set as active wallet if this is the first wallet
+                if len(self.wallets['wallets']) == 1:
+                    self.wallets['active_wallet_index'] = 0
+                
+                # Save wallets
+                self._save_wallets()
+                
+                # Update trader's wallet info to use the active wallet
+                self.solana_trader.wallet_info = self._get_active_wallet()
+                
                 # Only show part of the private key for security
                 private_key = wallet_info['private_key']
                 safe_private_key = f"{private_key[:5]}...{private_key[-5:]}"
                 
-                # Simplified response without complex Markdown
                 response = (
                     "✅ New wallet created successfully!\n\n"
                     f"🔑 Public Address: {wallet_info['public_key']}\n\n"
                     f"🔐 Private Key: {safe_private_key}\n\n"
-                    "⚠️ IMPORTANT: Your full private key has been saved in the wallet_credentials.txt file. "
-                    "Keep this file secure and do not share it with anyone!"
+                    f"Total Wallets: {len(self.wallets['wallets'])}\n"
+                    "Use 'Manage Wallets' to switch between wallets."
                 )
-                
-                # Remove parse_mode parameter
+        
                 await query.edit_message_text(response)
             else:
                 await query.edit_message_text("❌ Failed to create a new wallet. Please try again later.")
