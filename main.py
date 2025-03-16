@@ -31,6 +31,13 @@ class TradingBot:
         self.monitored_groups = self._load_monitored_groups()
         self.trading_settings = self._load_trading_settings()
         
+        self.wallets = self._load_wallets()
+            # If we have a wallet_info but no wallets yet, migrate it
+        if self.wallet_info and not self.wallets['wallets']:
+            self.wallet_info['name'] = "Wallet 1"
+            self.wallets['wallets'].append(self.wallet_info)
+            self.wallets['active_wallet_index'] = 0
+            self._save_wallets()
         # Initialize components
         self.solana_trader = SolanaTrader(self.wallet_info, self.trading_settings)
         
@@ -104,6 +111,29 @@ class TradingBot:
                 json.dump(default_settings, f)
             return default_settings
 
+    def _load_wallets(self):
+        """Load all saved wallets."""
+        try:
+            with open('wallets.json', 'r') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            # Initialize with empty list
+            wallets = {'wallets': [], 'active_wallet_index': -1}
+            with open('wallets.json', 'w') as f:
+                json.dump(wallets, f)
+            return wallets
+
+    def _save_wallets(self):
+        """Save all wallets to file."""
+        with open('wallets.json', 'w') as f:
+            json.dump(self.wallets, f)
+
+    def _get_active_wallet(self):
+        """Get the currently active wallet."""
+        if self.wallets['active_wallet_index'] >= 0 and len(self.wallets['wallets']) > self.wallets['active_wallet_index']:
+            return self.wallets['wallets'][self.wallets['active_wallet_index']]
+        return None
+
     def _save_trading_settings(self):
         with open('trading_settings.json', 'w') as f:
             json.dump(self.trading_settings, f)
@@ -121,7 +151,7 @@ class TradingBot:
         self.telegram_bot.add_handler(CommandHandler("settings", self.show_settings))
         self.telegram_bot.add_handler(CommandHandler("set_investment", self.set_investment))
         self.telegram_bot.add_handler(CommandHandler("set_take_profit", self.set_take_profit))
-        
+        self.telegram_bot.add_handler(CommandHandler("manage_wallets", self.manage_wallets))
         # Callback query handler
         self.telegram_bot.add_handler(CallbackQueryHandler(self.button_handler))
         
@@ -141,6 +171,7 @@ class TradingBot:
         )
         
         keyboard = [
+            [InlineKeyboardButton("Manage Wallets", callback_data='manage_wallets')],
             [InlineKeyboardButton("Create Wallet", callback_data='create_wallet')],
             [InlineKeyboardButton("Wallet Info", callback_data='wallet_info')],
             [InlineKeyboardButton("Manage Groups", callback_data='manage_groups')],
@@ -185,7 +216,21 @@ class TradingBot:
         new_wallet = self.solana_trader.create_new_wallet()
         
         if new_wallet:
-            self._save_wallet_info(new_wallet)
+            # Add name to wallet info
+            new_wallet['name'] = f"Wallet {len(self.wallets['wallets']) + 1}"
+            
+            # Add to wallets list
+            self.wallets['wallets'].append(new_wallet)
+            
+            # Set as active wallet
+            self.wallets['active_wallet_index'] = len(self.wallets['wallets']) - 1
+            
+            # Save wallets
+            self._save_wallets()
+            
+            # Update trader's wallet info
+            self.solana_trader.wallet_info = new_wallet
+            self.wallet_info = new_wallet  # For backward compatibility
             
             # Only show part of the private key for security
             private_key = new_wallet['private_key']
@@ -195,13 +240,39 @@ class TradingBot:
                 "✅ New wallet created successfully!\n\n"
                 f"🔑 Public Address: `{new_wallet['public_key']}`\n\n"
                 f"🔐 Private Key: `{safe_private_key}`\n\n"
-                "⚠️ *IMPORTANT:* Your full private key has been saved in the wallet_credentials.txt file. "
-                "Keep this file secure and do not share it with anyone!"
+                "⚠️ *IMPORTANT:* Your wallet has been saved and set as active."
             )
         else:
             response = "❌ Failed to create a new wallet. Please try again later."
         
         await update.message.reply_text(response, parse_mode='Markdown')
+
+    async def manage_wallets(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show wallet management options."""
+        keyboard = []
+        
+        # Add button for each wallet
+        for i, wallet in enumerate(self.wallets['wallets']):
+            wallet_name = wallet.get('name', f"Wallet {i+1}")
+            active_marker = "✅ " if i == self.wallets['active_wallet_index'] else ""
+            keyboard.append([InlineKeyboardButton(
+                f"{active_marker}{wallet_name}", 
+                callback_data=f"select_wallet_{i}"
+            )])
+        
+        # Add button to create new wallet
+        keyboard.append([InlineKeyboardButton("➕ Create New Wallet", callback_data="create_wallet")])
+        keyboard.append([InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "🔑 *Wallet Management*\n\nSelect a wallet to use or create a new one:",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+
+
+    )
 
     async def wallet_info_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Display wallet information."""
@@ -469,7 +540,30 @@ class TradingBot:
             )
             
             await query.edit_message_text(response)
-        
+        elif callback_data == 'manage_wallets':
+            await self.manage_wallets(update, context)
+
+        elif callback_data.startswith('select_wallet_'):
+            # Extract wallet index from callback data
+            wallet_index = int(callback_data[14:])
+            
+            if wallet_index >= 0 and wallet_index < len(self.wallets['wallets']):
+                # Set as active wallet
+                self.wallets['active_wallet_index'] = wallet_index
+                selected_wallet = self.wallets['wallets'][wallet_index]
+                
+                # Update trader's wallet info
+                self.solana_trader.wallet_info = selected_wallet
+                self.wallet_info = selected_wallet  # For backward compatibility
+                
+                # Save wallets
+                self._save_wallets()
+                
+                wallet_name = selected_wallet.get('name', f"Wallet {wallet_index+1}")
+                await query.edit_message_text(f"✅ Wallet '{wallet_name}' is now active.")
+            else:
+                await query.edit_message_text("❌ Invalid wallet selection.")
+
         elif callback_data == 'manage_groups':
             keyboard = [
                 [InlineKeyboardButton("Add Group", callback_data='add_group')],
@@ -524,6 +618,7 @@ class TradingBot:
         elif callback_data == 'main_menu':
             # Return to main menu
             keyboard = [
+                [InlineKeyboardButton("Manage Wallets", callback_data='manage_wallets')],
                 [InlineKeyboardButton("Create Wallet", callback_data='create_wallet')],
                 [InlineKeyboardButton("Wallet Info", callback_data='wallet_info')],
                 [InlineKeyboardButton("Manage Groups", callback_data='manage_groups')],
