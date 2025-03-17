@@ -44,30 +44,43 @@ class TelegramListener:
         logger.info("Telegram client started")
         self.running = True
         
-        # Register message handler
-        @self.client.on(events.NewMessage(chats=self.monitored_groups))
+        # Add initial groups if provided
+        if initial_groups:
+            for group in initial_groups:
+                await self.add_group(group)
+        
+        # Register the message handler
+        self.client.add_event_handler(
+            self.message_handler,
+            events.NewMessage()
+        )
         # In telegram_listener.py, modify the message_handler function:
-        async def message_handler(event):
-            # Skip edits, forwards, and replies
-            if event.message.forward or event.message.reply_to:
-                return
-                
-            # Get message text
-            message_text = event.message.text
+    async def message_handler(self, event):
+        # Skip messages from non-monitored groups
+        chat = await event.get_chat()
+        if chat not in self.monitored_groups:
+            return
+        
+        # Skip edits, forwards, and replies
+        if event.message.forward or event.message.reply_to:
+            return
             
-            # Find Solana addresses in the message
-            addresses = self.solana_address_pattern.findall(message_text)
+        # Get message text
+        message_text = event.message.text
+        
+        # Find Solana addresses in the message
+        addresses = self.solana_address_pattern.findall(message_text)
+        
+        if addresses:
+            group_entity = await event.get_chat()
+            group_name = getattr(group_entity, 'title', str(group_entity.id))
             
-            if addresses:
-                group_entity = await event.get_chat()
-                group_name = getattr(group_entity, 'title', str(group_entity.id))
+            for address in addresses:
+                logger.info(f"Found new CA: {address} in {group_name}")
                 
-                for address in addresses:
-                    logger.info(f"Found new CA: {address} in {group_name}")
-                    
-                    # Call the callback function for each address found
-                    if self.callback:
-                        await self.callback(address, group_name)
+                # Call the callback function for each address found
+                if self.callback:
+                    await self.callback(address, group_name)
 
     async def add_group(self, group_url):
         """Add a group to monitor."""
