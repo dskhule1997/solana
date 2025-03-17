@@ -30,7 +30,7 @@ class TradingBot:
         self.wallet_info = self._load_wallet_info()
         self.monitored_groups = self._load_monitored_groups()
         self.trading_settings = self._load_trading_settings()
-        
+        self._load_chat_id()
         self.wallets = self._load_wallets()
             # If we have a wallet_info but no wallets yet, migrate it
         if self.wallet_info and not self.wallets['wallets']:
@@ -137,6 +137,15 @@ class TradingBot:
     def _save_trading_settings(self):
         with open('trading_settings.json', 'w') as f:
             json.dump(self.trading_settings, f)
+            
+    def _load_chat_id(self):
+        """Load the stored chat ID if it exists."""
+        try:
+            with open('chat_id.txt', 'r') as f:
+                self.user_chat_id = int(f.read().strip())
+        except FileNotFoundError:
+            logger.warning("No stored chat ID found. User needs to start the bot first.")
+            self.user_chat_id = None
 
     def _setup_handlers(self):
         # Command handlers
@@ -165,8 +174,16 @@ class TradingBot:
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Send a message when the command /start is issued."""
         user = update.effective_user
-        # Store the chat ID for notifications
+        
+        # Always store/update the chat ID for notifications
         self.user_chat_id = update.effective_chat.id
+        
+        # Save chat_id to a file for persistence
+        try:
+            with open('chat_id.txt', 'w') as f:
+                f.write(str(self.user_chat_id))
+        except Exception as e:
+            logger.error(f"Error saving chat ID: {str(e)}")
         
         welcome_text = (
             f"Hi {user.first_name}! I'm your Solana Trading Bot.\n\n"
@@ -765,14 +782,18 @@ class TradingBot:
         """Process a new crypto address found in a monitored group."""
         logger.info(f"New CA detected: {ca_address} from {group_name}")
         
-        # First, notify about the new CA detection regardless of trading
-        await self.notify_user(
-            f"🔍 *New Token Detected*\n\n"
-            f"Token Address: `{ca_address}`\n"
-            f"Found in: {group_name}\n"
-        )
-        
-        # Check if this token has already been traded
+        # Always notify about the new CA detection first
+        try:
+            await self.notify_user(
+                f"🔍 *New Token Detected*\n\n"
+                f"Token Address: `{ca_address}`\n"
+                f"Found in: {group_name}\n"
+                f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+        except Exception as e:
+            logger.error(f"Error sending notification: {str(e)}")
+
+        # Then proceed with trading logic if applicable
         if ca_address in self.trading_settings['traded_tokens']:
             await self.notify_user(
                 f"ℹ️ *Trading Skipped*\n\n"
