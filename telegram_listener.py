@@ -50,7 +50,7 @@ class TelegramListener:
             # Skip edits, forwards, and replies
             if event.message.forward or event.message.reply_to:
                 return
-            
+                
             # Get message text
             message_text = event.message.text
             
@@ -62,14 +62,31 @@ class TelegramListener:
                 group_name = getattr(group_entity, 'title', str(group_entity.id))
                 
                 for address in addresses:
-                    # Check if we've already processed this address
-                    if address not in self.processed_cas:
-                        logger.info(f"Found new CA: {address} in {group_name}")
-                        self.processed_cas.add(address)
-                        
-                        # Call the callback function
-                        if self.callback:
-                            await self.callback(address, group_name)
+                    logger.info(f"Found new CA: {address} in {group_name}")
+                    
+                    # Call the callback function for EVERY address found, regardless of processing status
+                    if self.callback:
+                        await self.callback(address, group_name)
+                    
+                    # Get token information (this would need to be implemented)
+                    token_info = await self.get_token_info(address)
+                    
+                    # Format and send notification about the new token
+                    notification_message = f"""
+                    🔔 **New Token Detected**
+                    CA: `{address}`
+                    Group: {group_name}
+                    Name: {token_info.get('name', 'Unknown')}
+                    Symbol: {token_info.get('symbol', 'Unknown')}
+                    Liquidity: {token_info.get('liquidity', 'Unknown')}
+                    """
+                    # You would need to send this notification to your users
+                    # This could be through a dedicated channel or to specific users
+                    await self.send_notification(notification_message)
+                    
+                    # Call the callback function for potential trading
+                    if self.callback:
+                        await self.callback(address, group_name)
         
         # Add initial groups if provided
         if initial_groups:
@@ -127,7 +144,7 @@ class TelegramListener:
                 elif str(group) == group_username:
                     group_to_remove = group
                     break
-            
+
             if group_to_remove:
                 self.monitored_groups.remove(group_to_remove)
                 logger.info(f"Removed group {group_username} from monitoring")
