@@ -46,6 +46,7 @@ class TelegramListener:
         
         # Register message handler
         @self.client.on(events.NewMessage(chats=self.monitored_groups))
+        # In telegram_listener.py, modify the message_handler function:
         async def message_handler(event):
             # Skip edits, forwards, and replies
             if event.message.forward or event.message.reply_to:
@@ -64,36 +65,9 @@ class TelegramListener:
                 for address in addresses:
                     logger.info(f"Found new CA: {address} in {group_name}")
                     
-                    # Call the callback function for EVERY address found, regardless of processing status
+                    # Call the callback function for each address found
                     if self.callback:
                         await self.callback(address, group_name)
-                    
-                    # Get token information (this would need to be implemented)
-                    token_info = await self.get_token_info(address)
-                    
-                    # Format and send notification about the new token
-                    notification_message = f"""
-                    🔔 **New Token Detected**
-                    CA: `{address}`
-                    Group: {group_name}
-                    Name: {token_info.get('name', 'Unknown')}
-                    Symbol: {token_info.get('symbol', 'Unknown')}
-                    Liquidity: {token_info.get('liquidity', 'Unknown')}
-                    """
-                    # You would need to send this notification to your users
-                    # This could be through a dedicated channel or to specific users
-                    await self.send_notification(notification_message)
-                    
-                    # Call the callback function for potential trading
-                    if self.callback:
-                        await self.callback(address, group_name)
-        
-        # Add initial groups if provided
-        if initial_groups:
-            for group in initial_groups:
-                await self.add_group(group)
-        
-        return True
 
     async def add_group(self, group_url):
         """Add a group to monitor."""
