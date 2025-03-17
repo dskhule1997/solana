@@ -788,8 +788,7 @@ class TradingBot:
             await self.notify_user(
                 f"🔍 *New Token Detected*\n\n"
                 f"Token Address: `{ca_address}`\n"
-                f"Found in: {group_name}\n"
-                f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                f"Found in: {group_name}"
             )
         except Exception as e:
             logger.error(f"Error sending notification: {str(e)}")
