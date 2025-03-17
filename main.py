@@ -778,6 +778,7 @@ class TradingBot:
             # If there's no clear way to respond, log it
             logger.warning("Error occurred, but no valid update object to reply to.")
 
+    # This part already exists and should work if user_chat_id is properly set
     async def process_new_ca(self, ca_address, group_name):
         """Process a new crypto address found in a monitored group."""
         logger.info(f"New CA detected: {ca_address} from {group_name}")
